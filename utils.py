@@ -1,5 +1,4 @@
 import matplotlib.pyplot as plt
-import os
 
 def plot_training_loss(loss_history, val_loss_history=None, config=None, save_path="Figures/training_loss_model_A.png"):
     """
@@ -80,7 +79,6 @@ def plot_training_loss(loss_history, val_loss_history=None, config=None, save_pa
     ax.legend(loc='upper center', framealpha=0.9)
     plt.tight_layout()
 
-    os.makedirs("Figures", exist_ok=True)
     plt.savefig(save_path, dpi=300)
     plt.close()
     print(f"\nLoss-Plot mit Parametern erfolgreich gespeichert unter: {save_path}")

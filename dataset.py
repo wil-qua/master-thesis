@@ -15,7 +15,6 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from scipy.ndimage import gaussian_filter, affine_transform
 from scipy.spatial.transform import Rotation as R
-import os
 
 
 class FlexibleDiffusionSampler:
@@ -171,7 +170,6 @@ class FlexibleDiffusionSampler:
             margin=dict(l=0, r=0, b=0, t=40)
         )
         
-        os.makedirs("Figures", exist_ok=True)
         html_file = "Figures/interactive_bvecs.html"
         fig.write_html(html_file)
         print(f"Interaktive Kugel gespeichert unter: {html_file}")
@@ -470,7 +468,7 @@ class HCPPatchDataset(Dataset):
             subj = self.subjects_cache[subj_idx]
             s = subj['sampler'].sample(num_targets=self.num_targets, plot=False)
             fixed_center = None
-            apply_rotation = False  # augmentation switch 
+            apply_rotation = True  # augmentation switch 
         
         # 1. Daten extrahieren (inklusive exakt zugeschnittenem hr_mask-Patch)
         hr_patch_b0, hr_patch_dwi, hr_target, hr_mask = extract_random_patch(

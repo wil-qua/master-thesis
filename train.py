@@ -69,6 +69,9 @@ class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard 
         self.meta_mlp = MetadataMLP(meta_dim, feature_channels=64)
         self.mod_silu = nn.SiLU()
 
+        # Bottleneck-Fusion für u_j_avg (64) + b0_feat_3 (64) = 128 -> 64
+        self.bottleneck_fuse = nn.Conv3d(128, 64, kernel_size=1)
+
         # --- Decoder ---
         # 64 (von unten) + 32 (b0 Skala 2) + 32 (DWI Skip Skala 2) = 128
         self.dec2_conv = nn.Conv3d(128, 32, kernel_size=3, padding=1)
@@ -179,12 +182,13 @@ def validate(model, val_loader, criterion, device, use_amp=False):
     
     with torch.no_grad():
         for batch_data in val_loader:
-            x_b0, x_dwi_padded, meta_padded, valid_mask, hr_target, hr_mask = batch_data
+            x_b0, x_dwi_padded, meta_padded, valid_mask_dwi, valid_mask_b0, hr_target, hr_mask = batch_data
             
             x_b0 = x_b0.to(device)
             x_dwi_padded = x_dwi_padded.to(device)
             meta_padded = meta_padded.to(device)
-            valid_mask = valid_mask.to(device)
+            valid_mask_dwi = valid_mask_dwi.to(device)
+            valid_mask_b0 = valid_mask_b0.to(device)
             hr_target = hr_target.to(device)
             hr_mask = hr_mask.to(device)
 
@@ -193,11 +197,11 @@ def validate(model, val_loader, criterion, device, use_amp=False):
             
             if use_amp:
                 with torch.amp.autocast('cuda'):
-                    sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask)
+                    sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
                     loss_map = criterion(sr_out, hr_target)
                     loss = (loss_map * hr_mask).sum() / (hr_mask.sum() * sr_out.shape[1] + 1e-8)
             else:
-                sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask)
+                sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
                 loss_map = criterion(sr_out, hr_target)
                 loss = (loss_map * hr_mask).sum() / (hr_mask.sum() * sr_out.shape[1] + 1e-8)
                 
@@ -213,6 +217,8 @@ def main():
     # Reproduzierbarkeit sicherstellen
     # np.random.seed(20260831)
     # torch.manual_seed(20260831)
+    os.makedirs("Figures", exist_ok=True)
+    os.makedirs("Models", exist_ok=True)
     
     print("Lade Trainings-Probanden...")
     train_cache = load_multi_subjects(
@@ -286,12 +292,13 @@ def main():
         epoch_loss = 0.0
         
         for batch_idx, batch_data in enumerate(train_loader):
-            x_b0, x_dwi_padded, meta_padded, valid_mask, hr_target, hr_mask = batch_data
+            x_b0, x_dwi_padded, meta_padded, valid_mask_dwi, valid_mask_b0, hr_target, hr_mask = batch_data
             
             x_b0 = x_b0.to(device)
             x_dwi_padded = x_dwi_padded.to(device)
             meta_padded = meta_padded.to(device)
-            valid_mask = valid_mask.to(device)
+            valid_mask_dwi = valid_mask_dwi.to(device)
+            valid_mask_b0 = valid_mask_b0.to(device)
             hr_target = hr_target.to(device)
             hr_mask = hr_mask.to(device)
 
@@ -302,7 +309,7 @@ def main():
             
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask)
+                    sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
 
                     # Elementweiser L1-Loss
                     loss_map = criterion(sr_out, hr_target)
@@ -314,7 +321,7 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask)
+                sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
                 loss_map = criterion(sr_out, hr_target)
                 loss = (loss_map * hr_mask).sum() / (hr_mask.sum() * sr_out.shape[1] + 1e-8)
                 loss.backward()
@@ -336,7 +343,7 @@ def main():
         # Bestes Modell abspeichern, wenn Val-Loss einen Rekord aufstellt
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "model_A_best.pth")
+            torch.save(model.state_dict(), "Models/model_A_best.pth")
             best_marker = " [* Best Val *]"
         else:
             best_marker = ""
@@ -348,10 +355,9 @@ def main():
         train_loss_history, 
         val_loss_history=val_loss_history, 
         config=config, 
-        save_path="training_loss_model_A.png"
+        save_path="Figures/training_loss_model_A.png"
     )
 
-    os.makedirs("Models", exist_ok=True)
     save_path = "Models/model_A.pth"
     torch.save(model.state_dict(), save_path)
     print(f"\nFinales Modell gespeichert unter: {save_path} (Bestes Val-Modell unter: model_A_best.pth)")
