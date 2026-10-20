@@ -1,0 +1,26 @@
+
+# Python-Umgebungen und Cache
+.venvs/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Lokale Editor- und Windows-Dateien
+.vscode/
+Thumbs.db
+Thumbs.db:encryptable
+
+# Lokale Konfiguration und Geheimnisse
+.env
+.env.*
+
+# Große wissenschaftliche Daten und Modelle
+*.nii
+*.nii.gz
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.pkl
+*.joblib
