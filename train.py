@@ -175,6 +175,85 @@ class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard 
         
         return out
 
+
+class Masked3DSSIMAndL1Loss(nn.Module):
+    """
+    Berechnet einen maskierten 3D-SSIM Loss (optional kombiniert mit Masked L1 Loss).
+    alpha = 1.0 -> Reiner 3D-SSIM Loss
+    alpha = 0.0 -> Reiner L1 Loss
+    alpha = 0.5 -> 50% SSIM + 50% L1 (Guter Kompromiss für scharfe Kanten + quantitative Treue)
+    SSIM: Messung der Ähnlichkeit zwischen zwei Bildern über Mittelwerte und Varianzen. Hohe Frequenzen (Kanten, Gewebeübergänge) bleiben. 
+    Bei Standard-Packages wie piq oder pytorch-mssim scheint es Probleme mit 3D-Volumina oder hr_mask zu geben.
+    """
+    def __init__(self, window_size=7, sigma=1.5, data_range=1.0, alpha=1.0):
+        super().__init__()
+        self.window_size = window_size
+        self.padding = window_size // 2
+        self.C1 = (0.01 * data_range) ** 2
+        self.C2 = (0.03 * data_range) ** 2
+        self.alpha = alpha
+        
+        # 3D Gauß-Kernel
+        coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g = g / g.sum()
+        kernel_3d = g[:, None, None] * g[None, :, None] * g[None, None, :]
+        kernel_3d = kernel_3d.unsqueeze(0).unsqueeze(0)  # Shape: [1, 1, K, K, K]
+        self.register_buffer("window", kernel_3d)  # fester Filter, der automatisch auf die GPU geschoben wird
+
+    def forward(self, pred, target, mask):
+        """
+        pred:   [B, C, D, H, W]
+        target: [B, C, D, H, W]
+        mask:   [B, 1, D, H, W]
+        """
+        # Für numerische Stabilität bei Mixed Precision (AMP) in float32 rechnen
+        pred_f = pred.float()
+        target_f = target.float()
+        mask_f = mask.float()
+        
+        C = pred_f.shape[1]
+        window = self.window.expand(C, 1, -1, -1, -1).to(pred_f.dtype)
+
+        # Lokale Mittelwerte (Luminanz)
+        mu1 = F.conv3d(pred_f, window, padding=self.padding, groups=C)
+        mu2 = F.conv3d(target_f, window, padding=self.padding, groups=C)
+
+        mu1_sq = mu1 ** 2
+        mu2_sq = mu2 ** 2
+        mu1_mu2 = mu1 * mu2
+
+        # Lokale Varianzen und Kovarianz (Kontrast & Struktur)
+        # clamp(min=0) verhindert negative Varianzen durch numerische Ungenauigkeiten
+        sigma1_sq = torch.clamp(
+            F.conv3d(pred_f * pred_f, window, padding=self.padding, groups=C) - mu1_sq, min=0.0
+        )
+        sigma2_sq = torch.clamp(
+            F.conv3d(target_f * target_f, window, padding=self.padding, groups=C) - mu2_sq, min=0.0
+        )
+        sigma12 = F.conv3d(pred_f * target_f, window, padding=self.padding, groups=C) - mu1_mu2
+
+        # Voxel-weise SSIM-Map berechnen
+        ssim_num = (2.0 * mu1_mu2 + self.C1) * (2.0 * sigma12 + self.C2)
+        ssim_den = (mu1_sq + mu2_sq + self.C1) * (sigma1_sq + sigma2_sq + self.C2)
+        ssim_map = ssim_num / (ssim_den + 1e-8)
+
+        # SSIM liegt bei [-1, 1] (1 = identisch). Als Loss wollen wir (1 - SSIM) minimieren:
+        ssim_loss_map = 1.0 - ssim_map
+
+        # Maskierung auf Gehirn-Voxel
+        denom = mask_f.sum() * C + 1e-8
+        masked_ssim_loss = (ssim_loss_map * mask_f).sum() / denom  # Zuerst 3D-SSIM-Map auf unmaskiertem Patch berechnen und dann erst Maske anwenden.
+
+        if self.alpha >= 1.0:
+            return masked_ssim_loss
+
+        # Optionaler L1-Anteil
+        l1_loss_map = torch.abs(pred_f - target_f)
+        masked_l1_loss = (l1_loss_map * mask_f).sum() / denom
+
+        return self.alpha * masked_ssim_loss + (1.0 - self.alpha) * masked_l1_loss
+
 def validate(model, val_loader, criterion, device, use_amp=False):
     """Führt die Validation auf den Validierungs-Probanden durch."""
     model.eval()
@@ -198,12 +277,10 @@ def validate(model, val_loader, criterion, device, use_amp=False):
             if use_amp:
                 with torch.amp.autocast('cuda'):
                     sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
-                    loss_map = criterion(sr_out, hr_target)
-                    loss = (loss_map * hr_mask).sum() / (hr_mask.sum() * sr_out.shape[1] + 1e-8)
+                    loss = criterion(sr_out, hr_target, hr_mask)
             else:
                 sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
-                loss_map = criterion(sr_out, hr_target)
-                loss = (loss_map * hr_mask).sum() / (hr_mask.sum() * sr_out.shape[1] + 1e-8)
+                loss = criterion(sr_out, hr_target, hr_mask)
                 
             val_loss += loss.item()
             
@@ -267,9 +344,8 @@ def main():
     
     model = ModelA_FlexibleSR(meta_dim=14).to(device)
 
-    # L1: MAE
-    # besser als MSE (L2), weil da große Abweichungen extrem gewichtet werden ->  verschwommene Kanten
-    criterion = nn.L1Loss(reduction='none')  # jedes Voxel behält eigenen Fehlerwert
+    # 50% SSIM + 50% L1 (Guter Kompromiss für scharfe Kanten + quantitative Treue)
+    criterion = Masked3DSSIMAndL1Loss(window_size=7, data_range=1.0, alpha=0.5).to(device)
 
     # Adam + Decoupled Weight Decay (schützt vor Overfitting)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4) 
@@ -310,20 +386,14 @@ def main():
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
                     sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
-
-                    # Elementweiser L1-Loss
-                    loss_map = criterion(sr_out, hr_target)
-                    
-                    # Masked Loss: Fehler für Voxel innerhalb des Hirns durch Anzahl der Gehirn-Voxel teilen
-                    loss = (loss_map * hr_mask).sum() / (hr_mask.sum() * sr_out.shape[1] + 1e-8)
+                    loss = criterion(sr_out, hr_target, hr_mask)
                 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
-                loss_map = criterion(sr_out, hr_target)
-                loss = (loss_map * hr_mask).sum() / (hr_mask.sum() * sr_out.shape[1] + 1e-8)
+                loss = criterion(sr_out, hr_target, hr_mask)
                 loss.backward()
                 optimizer.step()
                 
