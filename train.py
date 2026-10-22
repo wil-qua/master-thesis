@@ -180,7 +180,7 @@ class Masked3DSSIMAndL1Loss(nn.Module):
     """
     Berechnet einen maskierten 3D-SSIM Loss (optional kombiniert mit Masked L1 Loss).
     alpha = 1.0 -> Reiner 3D-SSIM Loss
-    alpha = 0.0 -> Reiner L1 Loss
+    alpha = 0.0 -> Reiner L1 Loss (MAE)
     alpha = 0.5 -> 50% SSIM + 50% L1 (Guter Kompromiss für scharfe Kanten + quantitative Treue)
     SSIM: Messung der Ähnlichkeit zwischen zwei Bildern über Mittelwerte und Varianzen. Hohe Frequenzen (Kanten, Gewebeübergänge) bleiben. 
     Bei Standard-Packages wie piq oder pytorch-mssim scheint es Probleme mit 3D-Volumina oder hr_mask zu geben.
@@ -296,6 +296,15 @@ def main():
     # torch.manual_seed(20260831)
     os.makedirs("Figures", exist_ok=True)
     os.makedirs("Models", exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(device)
+        total_mem = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+        print(f"\nNutze Gerät: {device} ({gpu_name} | {total_mem:.1f} GB VRAM)")
+    else:
+        print(f"\nNutze Gerät: CPU")
+        
     
     print("Lade Trainings-Probanden...")
     train_cache = load_multi_subjects(
@@ -333,14 +342,6 @@ def main():
     
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=0)
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        gpu_name = torch.cuda.get_device_name(device)
-        total_mem = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-        print(f"\nNutze Gerät: {device} ({gpu_name} | {total_mem:.1f} GB VRAM)")
-    else:
-        print(f"\nNutze Gerät: CPU")
     
     model = ModelA_FlexibleSR(meta_dim=14).to(device)
 

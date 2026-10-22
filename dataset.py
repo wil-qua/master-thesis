@@ -98,45 +98,6 @@ class FlexibleDiffusionSampler:
 
         return pool_indices[selected]
 
-    def _electrostatic_subset_selection_old(self, pool_indices, n_select):
-        """
-        Greedy-Auswahl von n_select Richtungen aus dem Pool, die die 
-        elektrostatische Abstoßungsenergie minimieren.
-        Beachtet die antipodale Symmetrie (q = -q) der Diffusion.
-        (Weil Wasser entlang Gewebefaser in beide Richtungen gleichmäßig diffundiert.)
-        """
-        pool_bvecs = self.dwi_bvecs[pool_indices]
-        norms = np.linalg.norm(pool_bvecs, axis=1, keepdims=True)
-        pool_bvecs = pool_bvecs / np.clip(norms, a_min=1e-8, a_max=None)
-        
-        # 1. Starte mit einem komplett zufälligen Vektor aus dem Pool
-        selected_idx_local = [np.random.choice(len(pool_indices))]
-        
-        # 2. Wähle iterativ den Vektor, der die geringste Abstoßungsenergie hinzufügt
-        for _ in range(1, n_select):
-            selected_bvecs = pool_bvecs[selected_idx_local]
-            
-            # Skalarprodukt liefert den Kosinus des Winkels. 
-            # Wegen antipodaler Symmetrie nehmen wir den absoluten Wert.
-            # Berechne SP zwischen allen verfügbaren Vektoren und den bereits ausgewählten Vektoren.
-            dot_products = np.abs(np.dot(pool_bvecs, selected_bvecs.T))
-            
-            # Elektrostatische Energie-Analogie für dMRI: E = sum( 1 / sin^2(theta) )
-            # sin^2(theta) = 1 - cos^2(theta) = 1 - dot_product^2
-            sin_sq = 1.0 - dot_products**2
-            
-            # epsilon (1e-6) verhindert Division durch 0 bei identischen Vektoren
-            energy = np.sum(1.0 / (sin_sq + 1e-6), axis=1)
-            
-            # Bereits gewählte Vektoren ausschließen (Energie auf unendlich setzen)
-            energy[selected_idx_local] = np.inf
-            
-            # Den Vektor mit der minimalen totalen Abstoßungsenergie zum Subset hinzufügen
-            best_next_idx = np.argmin(energy)
-            selected_idx_local.append(best_next_idx)
-
-        return pool_indices[selected_idx_local]
-
     def evaluate_spherical_distribution(self, bvecs, antipodal=True):
         """
         Berechnet die kleinsten Abstände (globales Minimum und Durchschnitt der 
@@ -295,20 +256,6 @@ class FlexibleDiffusionSampler:
         
         # Elektrostatisch optimierte Ziehung für DWI
         input_indices = self._electrostatic_subset_selection(all_local_dwi, n_dwi, rng=rng)
-        input_indices_old = self._electrostatic_subset_selection_old(all_local_dwi, n_dwi)
-
-        stats_new = self.evaluate_spherical_distribution(self.dwi_bvecs[input_indices], antipodal=True)
-        stats_old = self.evaluate_spherical_distribution(self.dwi_bvecs[input_indices_old], antipodal=True)
-
-        # print(f"Electrostatic Repulsion:")
-        # print(f"  Kleinster Winkel (Global Min): {stats_new['global_min_angle_deg']:.2f}° "
-        #     f"(Paar: {stats_new['closest_pair_indices']})")
-        # print(f"  Ø Nächster Nachbar:            {stats_new['mean_nn_angle_deg']:.2f}° ± {stats_new['std_nn_angle_deg']:.2f}°\n")
-
-        # print(f"Alte Funktion:")
-        # print(f"  Kleinster Winkel (Global Min): {stats_old['global_min_angle_deg']:.2f}° "
-        #     f"(Paar: {stats_old['closest_pair_indices']})")
-        # print(f"  Ø Nächster Nachbar:            {stats_old['mean_nn_angle_deg']:.2f}° ± {stats_old['std_nn_angle_deg']:.2f}°")
 
         # Disjunkte Trennung: Rest-DWIs als withheld targets
         remaining_dwi_indices = np.setdiff1d(all_local_dwi, input_indices, assume_unique=True)
@@ -340,7 +287,12 @@ def calculate_normalization_scalar(b0_volumes, brain_mask):
     Berechnet den Skalierungsfaktor für die Normalisierung basierend auf dem
     95. Perzentil der b0-Signale innerhalb der Gehirnmaske.
     """
-    mean_b0 = np.mean(b0_volumes, axis=-1)
+    if b0_volumes.ndim == 3:
+        # Einzelnes b0-Volumen: Shape (X, Y, Z)
+        mean_b0 = b0_volumes
+    elif b0_volumes.ndim == 4:
+        # Mehrere b0-Volumes: Shape (X, Y, Z, N)
+        mean_b0 = np.mean(b0_volumes, axis=-1)
     # Nur Voxel berücksichtigen, die in der Maske liegen und positive Signale haben
     valid_voxels = mean_b0[(brain_mask > 0) & (mean_b0 > 0)]
     scalar = np.percentile(valid_voxels, 95)
@@ -348,8 +300,9 @@ def calculate_normalization_scalar(b0_volumes, brain_mask):
 
 def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_threshold, min_b_val, max_b_val):
     """
-    Lädt eine Liste von Probanden (NIfTIs, bvals, bvecs, Masken) in den RAM-Cache 
-    und normalisiert jeden Probanden individuell anhand seines b0-95. Perzentils.
+    Lädt die Daten aller Probanden in den RAM-Cache und normalisiert
+    jeden Probanden anhand des 95. Perzentils seines ersten b0-Volumens
+    innerhalb der Gehirnmaske.
     """
     subjects_cache = []
     
@@ -370,7 +323,7 @@ def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_thre
         
         b0_4d_array = full_data_4d[..., sampler.global_b0_indices]
         dwi_4d_array = full_data_4d[..., sampler.global_dwi_indices]
-        
+
         scalar = calculate_normalization_scalar(b0_4d_array, brain_mask)
         
         subjects_cache.append({
@@ -525,10 +478,17 @@ def generate_and_augment_lr_patch(
     blurred_patch = gaussian_filter(hr_patch, sigma=sigma_spatial)  # Weichzeichner/Tiefpassfilter, Monai bietet hier GaussianSmoothd für räumlichen Gauß-Blur.
     lr_patch = blurred_patch[::downscale_factor, ::downscale_factor, ::downscale_factor, :]
 
-    # --- 3. BOUNDED INPUT NOISE ---
+    # --- 3. PHYSICALLY REALISTIC dMRI NOISE (Rician Noise statt Clipped Gaussian) ---
     if noise_std > 0:
-        noise = np.random.normal(loc=0.0, scale=noise_std, size=lr_patch.shape)
-        lr_patch = np.clip(lr_patch + noise, a_min=0.0, a_max=None)
+        # Optional wie in MONAI (sample_std=True): Rauschstärke zufällig zwischen 0 und noise_std ziehen
+        current_std = np.random.uniform(0.0, noise_std)
+        
+        # Zwei unabhängige Gauß-Rauschfelder (in float32, um Speicher zu sparen)
+        noise_real = np.random.normal(loc=0.0, scale=current_std, size=lr_patch.shape).astype(lr_patch.dtype)
+        noise_imag = np.random.normal(loc=0.0, scale=current_std, size=lr_patch.shape).astype(lr_patch.dtype)
+        
+        # Betragsbildung (Magnituden-MRT): Automatisch >= 0, kein np.clip nötig
+        lr_patch = np.sqrt((lr_patch + noise_real)**2 + noise_imag**2)
         
     return lr_patch, hr_mask, augmented_bvecs
 
