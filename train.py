@@ -81,7 +81,7 @@ class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard 
         self.dec1_conv = nn.Conv3d(64, 16, kernel_size=3, padding=1)
         self.dec1 = nn.Sequential(ResBlock3D(16), ResBlock3D(16))
 
-        # --- Upsampling Head ---
+        # --- Upsampling Head, um von LR zu HR zu kommen ---
         self.head_conv = nn.Sequential(
             nn.Conv3d(16, 8, kernel_size=3, padding=1),
             nn.SiLU(),
@@ -185,7 +185,7 @@ class Masked3DSSIMAndL1Loss(nn.Module):
     SSIM: Messung der Ähnlichkeit zwischen zwei Bildern über Mittelwerte und Varianzen. Hohe Frequenzen (Kanten, Gewebeübergänge) bleiben. 
     Bei Standard-Packages wie piq oder pytorch-mssim scheint es Probleme mit 3D-Volumina oder hr_mask zu geben.
     """
-    def __init__(self, window_size=7, sigma=1.5, data_range=1.0, alpha=1.0):
+    def __init__(self, window_size=7, sigma=1.5, data_range=1.0, alpha=0.5):
         super().__init__()
         self.window_size = window_size
         self.padding = window_size // 2

@@ -320,25 +320,72 @@ def extract_random_patch(hr_data_b0, hr_data_dwi, mask, b0_indices, input_indice
     
     return hr_patch_b0, hr_patch_dwi, hr_target, hr_mask
 
+def sample_random_90deg_rotation(rng=None):
+    """
+    Zieht zufällig eine der 24 echten 3D-90°-Rotationen (det(R) = +1, keine Spiegelung).
+    Gibt zurück:
+        perm:       Tuple der Länge 3 (Achsenpermutation für np.transpose)
+        signs:      Tuple der Länge 3 aus {-1, +1} (Flip-Richtung pro neuer Achse)
+        rot_matrix:Exakte 3x3 Rotationsmatrix (float32) für die bvecs
+    """
+    if rng is None:
+        rng = np.random
+
+    # Alle 6 Permutationen der 3 Raumachsen (0, 1, 2) mit ihrem Paritäts-Vorzeichen
+    perms_with_parity = [
+        ((0, 1, 2), +1),
+        ((0, 2, 1), -1),
+        ((1, 0, 2), -1),
+        ((1, 2, 0), +1),
+        ((2, 0, 1), +1),
+        ((2, 1, 0), -1),
+    ]
+    perm, parity = perms_with_parity[int(rng.randint(0, 6))]
+
+    # Erste zwei Vorzeichen frei wählen (+1 oder -1), das dritte so setzen, dass det(R) = +1
+    s0 = int(rng.choice([-1, 1]))
+    s1 = int(rng.choice([-1, 1]))
+    s2 = parity * s0 * s1
+    signs = (s0, s1, s2)
+
+    # Zugehörige 3x3 Rotationsmatrix für die Gradienten (bvecs) aufbauen
+    rot_matrix = np.zeros((3, 3), dtype=np.float32)
+    for new_axis, old_axis in enumerate(perm):
+        rot_matrix[new_axis, old_axis] = signs[new_axis]
+
+    return perm, signs, rot_matrix
+
+
+def apply_3d_90deg_rotation(volume, perm, signs):
+    """
+    Wendet die 90°-Rotation komplett verlustfrei (ohne Interpolation!) 
+    auf ein 3D-Array [D, H, W] oder 4D-Array [D, H, W, C] an.
+    """
+    if volume.ndim == 4:
+        out = np.transpose(volume, (perm[0], perm[1], perm[2], 3))
+    else:
+        out = np.transpose(volume, perm)
+
+    flip_axes = [ax for ax in range(3) if signs[ax] == -1]
+    if flip_axes:
+        out = np.flip(out, axis=flip_axes)
+
+    # .copy() sorgt für zusammenhängenden Speicher (wichtig für PyTorch und scipy)
+    return out.copy()
+
 def generate_and_augment_lr_patch(
     hr_patch, 
     hr_mask, 
     bvecs, 
-    rot_matrix=None, 
+    rot_spec=None, 
     downscale_factor=2, 
     sigma=0.8, 
     noise_std=0.01
 ):
     """
+    - Verlustfreie 90°-Rotation von Bild, Maske und Gradienten (bvecs)
     - Fester Blur und Downsampling als Clean Baseline
-    - Konsistente Rotation von Bild, Maske und Gradienten (bvecs)
     - Bounded Input Noise NACH der sauberen Baseline
-    - Keine elastische Verformungen und shell-unabhängige Intensitätsänderungen
-    
-    Parameter:
-        hr_patch: numpy array shape [D, H, W, N_directions]
-        brain_mask: numpy array shape [D, H, W]
-        bvecs: numpy array shape [N_directions, 3]
 
     Note:
     MONAI ist primär für 3D-Volumina (wie T1w/T2w) ausgelegt.
@@ -348,31 +395,16 @@ def generate_and_augment_lr_patch(
     """
     augmented_bvecs = bvecs.copy()
     
-    # --- 1. KONSISTENTE ROTATION AUF HR-EBENE ---
-    if rot_matrix is not None:
-        center_hr = np.array(hr_patch.shape[:3]) / 2.0
-        offset_hr = center_hr - np.dot(rot_matrix, center_hr)
-        
-        # A) 4D-Bild rotieren
-        rotated_channels = []
-        for c in range(hr_patch.shape[-1]):
-            rot_channel = affine_transform(
-                hr_patch[..., c], matrix=rot_matrix.T, offset=offset_hr, order=1, mode='constant', cval=0.0
-            )
-            rotated_channels.append(rot_channel)
-        hr_patch = np.stack(rotated_channels, axis=-1)
-        
-        # B) HR-Maske mitrotieren (WICHTIG für den Loss!)
-        hr_mask = affine_transform(
-            hr_mask.astype(float), matrix=rot_matrix.T, offset=offset_hr, order=0, mode='constant', cval=0.0
-        ) > 0.5
-        
-        # C) Gradienten mitrotieren
+    # --- 1. KONSISTENTE, VERLUSTFREIE 90°-ROTATION AUF HR-EBENE ---
+    if rot_spec is not None:
+        perm, signs, rot_matrix = rot_spec
+        hr_patch = apply_3d_90deg_rotation(hr_patch, perm, signs)
+        hr_mask = apply_3d_90deg_rotation(hr_mask, perm, signs)
         augmented_bvecs = np.dot(bvecs, rot_matrix.T)
 
     # --- 2. DEGRADATION (Blur + Subsampling) ---
     sigma_spatial = [sigma, sigma, sigma, 0.0]
-    blurred_patch = gaussian_filter(hr_patch, sigma=sigma_spatial)
+    blurred_patch = gaussian_filter(hr_patch, sigma=sigma_spatial)  # Weichzeichner/Tiefpassfilter, Monai bietet hier GaussianSmoothd für räumlichen Gauß-Blur.
     lr_patch = blurred_patch[::downscale_factor, ::downscale_factor, ::downscale_factor, :]
 
     # --- 3. BOUNDED INPUT NOISE ---
@@ -418,6 +450,8 @@ class HCPPatchDataset(Dataset):
         rng = np.random.RandomState(42)
         half_patch = self.patch_size // 2
         protocol_dwi_counts = [6, 12, 18, 24, 30]  # legt fest, mit wie vielen DWI-input-directions die Validierungs-Patches getestet werden sollen.
+        # BOOKMARK: Macht fixe DWI-Anzahl in Validation Sinn, oder soll es da auch flexibel gehalten werden?
+
         self.frozen_val_specs = []
         
         for i in range(self.num_patches):
@@ -468,7 +502,7 @@ class HCPPatchDataset(Dataset):
             subj = self.subjects_cache[subj_idx]
             s = subj['sampler'].sample(num_targets=self.num_targets, plot=False)
             fixed_center = None
-            apply_rotation = True  # augmentation switch 
+            apply_rotation = True  # Augmentation Switch (verlustfreie 90°-Rotationen)
         
         # 1. Daten extrahieren (inklusive exakt zugeschnittenem hr_mask-Patch)
         hr_patch_b0, hr_patch_dwi, hr_target, hr_mask = extract_random_patch(
@@ -477,37 +511,30 @@ class HCPPatchDataset(Dataset):
             self.patch_size, fixed_center=fixed_center
         )
         
-        # 2. Eine einzige Rotationsmatrix für konsistente Transformation aller Komponenten
+        # 2. Eine einzige 90°-Rotation (aus den 24 Würfel-Symmetrien) ziehen
         if apply_rotation:
-            rot_matrix = R.random().as_matrix()
+            rot_spec = sample_random_90deg_rotation()
         else:
-            rot_matrix = None
+            rot_spec = None
 
-        # 3. Augmentation & Degradation
+        # 3. Augmentation & Degradation (im Validation-Modus noise_std=0 oder fest lassen)
         dummy_bvecs = np.zeros((hr_patch_b0.shape[-1], 3))
         lr_patch_b0, _, _ = generate_and_augment_lr_patch(
             hr_patch_b0, hr_mask, dummy_bvecs, 
-            rot_matrix=rot_matrix, downscale_factor=self.downscale_factor
+            rot_spec=rot_spec, downscale_factor=self.downscale_factor
         )
         
         lr_patch_dwi, hr_mask_rotated, augmented_input_bvecs = generate_and_augment_lr_patch(
             hr_patch_dwi, hr_mask, s['input_bvecs'], 
-            rot_matrix=rot_matrix, downscale_factor=self.downscale_factor
+            rot_spec=rot_spec, downscale_factor=self.downscale_factor
         )
         
-        # 4. Target zwingend synchron mitrotieren (ohne Downsampling)
-        if rot_matrix is not None:
-            center_hr = np.array(hr_target.shape[:3]) / 2.0
-            offset_hr = center_hr - np.dot(rot_matrix, center_hr)
-            
-            rot_target = []
-            for c in range(hr_target.shape[-1]):
-                rot_channel = affine_transform(
-                    hr_target[..., c], matrix=rot_matrix.T, offset=offset_hr, order=1, mode='constant', cval=0.0
-                )
-                rot_target.append(rot_channel)
-            hr_target = np.stack(rot_target, axis=-1)
+        # 4. Target synchron und VERLUSTFREI mitrotieren (kein affine_transform Blur mehr!)
+        if rot_spec is not None:
+            perm, signs, rot_matrix = rot_spec
+            hr_target = apply_3d_90deg_rotation(hr_target, perm, signs)
         else:
+            rot_matrix = None
             hr_mask_rotated = hr_mask
 
         # 5. Dimensionsfolge für PyTorch anpassen: [X, Y, Z, N] -> [N, X, Y, Z]
@@ -562,10 +589,7 @@ class HCPPatchDataset(Dataset):
         padded_lr_dwi_tensor = torch.from_numpy(padded_lr_dwi).float().unsqueeze(1)
         padded_meta_tensor = torch.from_numpy(padded_meta_ij).float()
         valid_mask_tensor = torch.from_numpy(valid_mask)
-        
-        # Die rotierte, hochaufgelöste Maske für den Masked L1 Loss
         hr_mask_tensor = torch.from_numpy(hr_mask_rotated.astype(np.float32))
-
         valid_mask_b0_tensor = torch.from_numpy(valid_mask_b0)
 
         return (
