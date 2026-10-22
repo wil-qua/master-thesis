@@ -34,7 +34,10 @@ def plot_training_loss(loss_history, val_loss_history=None, config=None, save_pa
     ax.set_xlabel('Epoch', fontsize=12)
     ax.set_ylabel(f"Average {getattr(config, 'LOSS_FUNCTION')} Loss", fontsize=12)
     ax.grid(True, linestyle='--', alpha=0.6)
-    ax.set_xlim(1, len(loss_history))
+    if len(loss_history) > 1:
+        ax.set_xlim(1, len(loss_history))
+    else:
+        ax.set_xlim(0.5, 1.5)
 
     # --- Parameter-Textblock zusammenstellen ---
     param_lines = ["Trainings-Parameter:"]
