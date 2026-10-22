@@ -98,6 +98,111 @@ class FlexibleDiffusionSampler:
 
         return pool_indices[selected]
 
+    def _electrostatic_subset_selection_old(self, pool_indices, n_select):
+        """
+        Greedy-Auswahl von n_select Richtungen aus dem Pool, die die 
+        elektrostatische Abstoßungsenergie minimieren.
+        Beachtet die antipodale Symmetrie (q = -q) der Diffusion.
+        (Weil Wasser entlang Gewebefaser in beide Richtungen gleichmäßig diffundiert.)
+        """
+        pool_bvecs = self.dwi_bvecs[pool_indices]
+        norms = np.linalg.norm(pool_bvecs, axis=1, keepdims=True)
+        pool_bvecs = pool_bvecs / np.clip(norms, a_min=1e-8, a_max=None)
+        
+        # 1. Starte mit einem komplett zufälligen Vektor aus dem Pool
+        selected_idx_local = [np.random.choice(len(pool_indices))]
+        
+        # 2. Wähle iterativ den Vektor, der die geringste Abstoßungsenergie hinzufügt
+        for _ in range(1, n_select):
+            selected_bvecs = pool_bvecs[selected_idx_local]
+            
+            # Skalarprodukt liefert den Kosinus des Winkels. 
+            # Wegen antipodaler Symmetrie nehmen wir den absoluten Wert.
+            # Berechne SP zwischen allen verfügbaren Vektoren und den bereits ausgewählten Vektoren.
+            dot_products = np.abs(np.dot(pool_bvecs, selected_bvecs.T))
+            
+            # Elektrostatische Energie-Analogie für dMRI: E = sum( 1 / sin^2(theta) )
+            # sin^2(theta) = 1 - cos^2(theta) = 1 - dot_product^2
+            sin_sq = 1.0 - dot_products**2
+            
+            # epsilon (1e-6) verhindert Division durch 0 bei identischen Vektoren
+            energy = np.sum(1.0 / (sin_sq + 1e-6), axis=1)
+            
+            # Bereits gewählte Vektoren ausschließen (Energie auf unendlich setzen)
+            energy[selected_idx_local] = np.inf
+            
+            # Den Vektor mit der minimalen totalen Abstoßungsenergie zum Subset hinzufügen
+            best_next_idx = np.argmin(energy)
+            selected_idx_local.append(best_next_idx)
+
+        return pool_indices[selected_idx_local]
+
+    def evaluate_spherical_distribution(self, bvecs, antipodal=True):
+        """
+        Berechnet die kleinsten Abstände (globales Minimum und Durchschnitt der 
+        nächsten Nachbarn) für eine Menge von 3D-Vektoren auf einer Kugeloberfläche.
+        
+        Parameter:
+        - bvecs: Array der Shape (N, 3) mit den ausgewählten Vektoren.
+        - antipodal: Bool (Standard: True). Wenn True, werden u und -u als 
+                    identische Richtungen behandelt (wichtig für DWI bvecs).
+                    
+        Rückgabe:
+        - Dictionary mit Winkel- und euklidischen Abstandsmetriken sowie den 
+        Indizes des engsten Vektorpaares.
+        """
+        bvecs = np.asarray(bvecs, dtype=float)
+        if bvecs.ndim != 2 or bvecs.shape[1] != 3:
+            raise ValueError(f"Erwarte Shape (N, 3), erhalten: {bvecs.shape}")
+            
+        n_points = len(bvecs)
+        if n_points < 2:
+            raise ValueError("Mindestens 2 Punkte sind für einen Abstand nötig.")
+
+        # 1. Normierung auf die Einheitskugel (analog zu deiner Funktion)
+        norms = np.linalg.norm(bvecs, axis=1, keepdims=True)
+        u = bvecs / np.clip(norms, a_min=1e-8, a_max=None)
+
+        # 2. Paarweise Skalarprodukte berechnen: Shape (N, N)
+        dots = np.dot(u, u.T)
+        if antipodal:
+            # Bei DWI-Gradienten zählt der kleinere Winkel zu u oder -u
+            dots = np.abs(dots)
+            
+        # Numerisches Clipping für arccos und Wurzel
+        dots = np.clip(dots, -1.0, 1.0)
+
+        # 3. Winkelabstand in Grad berechnen
+        angles_deg = np.degrees(np.arccos(dots))
+        # Diagonale (Abstand zu sich selbst = 0) auf Unendlich setzen, 
+        # damit sie beim Minimum ignoriert wird
+        np.fill_diagonal(angles_deg, np.inf)
+
+        # 4. Euklidische Distanz (Sehnenabstand ||u - v||) berechnen
+        # Nutzt die Identität ||u - v|| = sqrt(2 - 2*(u*v))
+        chord_dists = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * dots))
+        np.fill_diagonal(chord_dists, np.inf)
+
+        # 5. Für jeden Punkt den Abstand zum jeweils nächsten Nachbarn finden
+        nearest_neighbor_angles = np.min(angles_deg, axis=1)
+        nearest_neighbor_chords = np.min(chord_dists, axis=1)
+
+        # 6. Globales Minimum und das zugehörige Vektor-Paar bestimmen
+        min_idx_flat = np.argmin(angles_deg)
+        pair_i, pair_j = np.unravel_index(min_idx_flat, angles_deg.shape)
+
+        return {
+            # --- Hauptmetrik: Das globale Minimum (Worst-Case-Paar) ---
+            "global_min_angle_deg": float(angles_deg[pair_i, pair_j]),
+            "global_min_chord_dist": float(chord_dists[pair_i, pair_j]),
+            "closest_pair_indices": (int(pair_i), int(pair_j)),
+            
+            # --- Zusatzmetrik: Durchschnittlicher Abstand zum nächsten Nachbarn ---
+            "mean_nn_angle_deg": float(np.mean(nearest_neighbor_angles)),
+            "std_nn_angle_deg": float(np.std(nearest_neighbor_angles)),
+            "mean_nn_chord_dist": float(np.mean(nearest_neighbor_chords)),
+        }
+
     def plot_bvecs_on_sphere(self, bvecs):
         """
         Generiert eine interaktive 3D-HTML-Datei der Diffusionsvektoren.
@@ -183,7 +288,6 @@ class FlexibleDiffusionSampler:
 
         if n_dwi is None:
             n_dwi = rng.randint(6, 31)
-            
         max_b0 = max(1, n_dwi // 6)
         n_b0 = rng.randint(1, min(max_b0, self.num_total_b0) + 1) if max_b0 > 1 else 1
             
@@ -191,7 +295,21 @@ class FlexibleDiffusionSampler:
         
         # Elektrostatisch optimierte Ziehung für DWI
         input_indices = self._electrostatic_subset_selection(all_local_dwi, n_dwi, rng=rng)
-        
+        input_indices_old = self._electrostatic_subset_selection_old(all_local_dwi, n_dwi)
+
+        stats_new = self.evaluate_spherical_distribution(self.dwi_bvecs[input_indices], antipodal=True)
+        stats_old = self.evaluate_spherical_distribution(self.dwi_bvecs[input_indices_old], antipodal=True)
+
+        # print(f"Electrostatic Repulsion:")
+        # print(f"  Kleinster Winkel (Global Min): {stats_new['global_min_angle_deg']:.2f}° "
+        #     f"(Paar: {stats_new['closest_pair_indices']})")
+        # print(f"  Ø Nächster Nachbar:            {stats_new['mean_nn_angle_deg']:.2f}° ± {stats_new['std_nn_angle_deg']:.2f}°\n")
+
+        # print(f"Alte Funktion:")
+        # print(f"  Kleinster Winkel (Global Min): {stats_old['global_min_angle_deg']:.2f}° "
+        #     f"(Paar: {stats_old['closest_pair_indices']})")
+        # print(f"  Ø Nächster Nachbar:            {stats_old['mean_nn_angle_deg']:.2f}° ± {stats_old['std_nn_angle_deg']:.2f}°")
+
         # Disjunkte Trennung: Rest-DWIs als withheld targets
         remaining_dwi_indices = np.setdiff1d(all_local_dwi, input_indices, assume_unique=True)
         withheld_target_indices = rng.choice(
