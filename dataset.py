@@ -287,12 +287,7 @@ def calculate_normalization_scalar(b0_volumes, brain_mask):
     Berechnet den Skalierungsfaktor für die Normalisierung basierend auf dem
     95. Perzentil der b0-Signale innerhalb der Gehirnmaske.
     """
-    if b0_volumes.ndim == 3:
-        # Einzelnes b0-Volumen: Shape (X, Y, Z)
-        mean_b0 = b0_volumes
-    elif b0_volumes.ndim == 4:
-        # Mehrere b0-Volumes: Shape (X, Y, Z, N)
-        mean_b0 = np.mean(b0_volumes, axis=-1)
+    mean_b0 = np.mean(b0_volumes, axis=-1)
     # Nur Voxel berücksichtigen, die in der Maske liegen und positive Signale haben
     valid_voxels = mean_b0[(brain_mask > 0) & (mean_b0 > 0)]
     scalar = np.percentile(valid_voxels, 95)
@@ -300,9 +295,8 @@ def calculate_normalization_scalar(b0_volumes, brain_mask):
 
 def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_threshold, min_b_val, max_b_val):
     """
-    Lädt die Daten aller Probanden in den RAM-Cache und normalisiert
-    jeden Probanden anhand des 95. Perzentils seines ersten b0-Volumens
-    innerhalb der Gehirnmaske.
+    Lädt eine Liste von Probanden (NIfTIs, bvals, bvecs, Masken) in den RAM-Cache 
+    und normalisiert jeden Probanden individuell anhand seines b0-95. Perzentils.
     """
     subjects_cache = []
     
@@ -323,7 +317,7 @@ def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_thre
         
         b0_4d_array = full_data_4d[..., sampler.global_b0_indices]
         dwi_4d_array = full_data_4d[..., sampler.global_dwi_indices]
-
+        
         scalar = calculate_normalization_scalar(b0_4d_array, brain_mask)
         
         subjects_cache.append({
@@ -336,46 +330,63 @@ def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_thre
     print(f"Alle {len(subjects_cache)} Probanden erfolgreich geladen und gecached.")
     return subjects_cache
 
-def extract_random_patch(hr_data_b0, hr_data_dwi, mask, b0_indices, input_indices, withheld_target_indices, patch_size=32, fixed_center=None):
+def extract_random_patch(hr_data_b0, hr_data_dwi, mask, b0_indices, input_indices, withheld_target_indices, patch_size=64, fixed_center=None, min_brain_fraction=0.8):
     """
     Sucht eine gültige Zentrumskoordinate innerhalb der Gehirnmaske und 
-    extrahiert einen 3D-Block (Patch) aus den getrennten b0- und DWI-Tensoren.
+    extrahiert einen 3D-Block (Patch), der mindestens zu `min_brain_fraction` 
+    mit Gehirnvoxeln gefüllt ist.
     """
     x_dim, y_dim, z_dim, _ = hr_data_dwi.shape
     half_patch = patch_size // 2
-    
+
     if fixed_center is not None:
         cx, cy, cz = fixed_center
+        hr_mask = mask[
+            cx - half_patch : cx + half_patch, 
+            cy - half_patch : cy + half_patch, 
+            cz - half_patch : cz + half_patch
+        ]
     else:
         valid_coords = np.where(mask > 0)
         num_valid = len(valid_coords[0])
-        
+
         while True:
             idx = np.random.randint(0, num_valid)
             cx = valid_coords[0][idx]
             cy = valid_coords[1][idx]
             cz = valid_coords[2][idx]
-            
+
+            # 1. Prüfen, ob der Patch komplett im Bildvolumen liegt
             if (cx - half_patch >= 0 and cx + half_patch <= x_dim and
                 cy - half_patch >= 0 and cy + half_patch <= y_dim and
                 cz - half_patch >= 0 and cz + half_patch <= z_dim):
-                break 
-            
-    # Patches aus b0 und DWI herausschneiden
+                
+                # 2. Masken-Patch ausschneiden und Füllgrad prüfen
+                hr_mask = mask[
+                    cx - half_patch : cx + half_patch, 
+                    cy - half_patch : cy + half_patch, 
+                    cz - half_patch : cz + half_patch
+                ]
+                
+                # Nur akzeptieren, wenn mindestens X% (z.B. 80%) im Gehirn liegen
+                if np.mean(hr_mask > 0) >= min_brain_fraction:
+                    break 
+
+    # Patches aus b0 und DWI herausschneiden (erst wenn gültiges Zentrum gefunden wurde)
     hr_patch_b0 = hr_data_b0[
         cx - half_patch : cx + half_patch, 
         cy - half_patch : cy + half_patch, 
         cz - half_patch : cz + half_patch, 
         b0_indices                                  
     ]
-    
+
     hr_patch_dwi = hr_data_dwi[
         cx - half_patch : cx + half_patch, 
         cy - half_patch : cy + half_patch, 
         cz - half_patch : cz + half_patch, 
         input_indices                                  
     ]
-    
+
     hr_target = hr_data_dwi[
         cx - half_patch : cx + half_patch, 
         cy - half_patch : cy + half_patch, 
@@ -383,12 +394,6 @@ def extract_random_patch(hr_data_b0, hr_data_dwi, mask, b0_indices, input_indice
         withheld_target_indices
     ]
 
-    hr_mask = mask[
-        cx - half_patch : cx + half_patch, 
-        cy - half_patch : cy + half_patch, 
-        cz - half_patch : cz + half_patch
-    ]
-    
     return hr_patch_b0, hr_patch_dwi, hr_target, hr_mask
 
 def sample_random_90deg_rotation(rng=None):
