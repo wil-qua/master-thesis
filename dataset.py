@@ -287,9 +287,11 @@ def calculate_normalization_scalar(b0_volumes, brain_mask):
     Berechnet den Skalierungsfaktor für die Normalisierung basierend auf dem
     95. Perzentil der b0-Signale innerhalb der Gehirnmaske.
     """
-    mean_b0 = np.mean(b0_volumes, axis=-1)
+    # Falls ein 4D-Array [X, Y, Z, N_b0] übergeben wird, nimm nur das erste b0-Bild (Index 0)
+    first_b0 = b0_volumes[..., 0] if b0_volumes.ndim == 4 else b0_volumes
+    
     # Nur Voxel berücksichtigen, die in der Maske liegen und positive Signale haben
-    valid_voxels = mean_b0[(brain_mask > 0) & (mean_b0 > 0)]
+    valid_voxels = first_b0[(brain_mask > 0) & (first_b0 > 0)]
     scalar = np.percentile(valid_voxels, 95)
     return float(scalar)
 
@@ -456,7 +458,7 @@ def generate_and_augment_lr_patch(
     rot_spec=None, 
     downscale_factor=2, 
     sigma=0.8, 
-    noise_std=0.01
+    noise_std=0.0  # 0.01, jetzt erstmal ausgeschaltet
 ):
     """
     - Verlustfreie 90°-Rotation von Bild, Maske und Gradienten (bvecs)
@@ -585,7 +587,7 @@ class HCPPatchDataset(Dataset):
             subj = self.subjects_cache[subj_idx]
             s = subj['sampler'].sample(num_targets=self.num_targets, plot=False)
             fixed_center = None
-            apply_rotation = True  # Augmentation Switch (verlustfreie 90°-Rotationen)
+            apply_rotation = False  # Augmentation Switch (verlustfreie 90°-Rotationen, erstmal ausgeschaltet, weil 90° Rotationen in der Praxis nicht vorkommen)
         
         # 1. Daten extrahieren (inklusive exakt zugeschnittenem hr_mask-Patch)
         hr_patch_b0, hr_patch_dwi, hr_target, hr_mask = extract_random_patch(
