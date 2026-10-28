@@ -265,9 +265,9 @@ def main():
     b0_full = full_data[..., sampler.global_b0_indices]
     dwi_full = full_data[..., sampler.global_dwi_indices]
 
-    # Signal-Normalisierung (nur auf ausgewählten Input-b0s wie im Workplan gefordert)
-    selected_b0_vols = b0_full[..., sample_spec["b0_indices"]]
-    norm_scalar = calculate_normalization_scalar(selected_b0_vols, brain_mask_mask := brain_mask_full)
+    # Signal-Normalisierung nach dem ersten b0-image
+    selected_b0_vol = b0_full[..., 0]
+    norm_scalar = calculate_normalization_scalar(selected_b0_vol, brain_mask_full)
 
     b0_norm = b0_full / norm_scalar
     dwi_norm = dwi_full / norm_scalar
