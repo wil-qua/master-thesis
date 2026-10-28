@@ -96,7 +96,10 @@ class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard 
         features:   [B, N, C, D, H, W]
         valid_mask: [B, N] (True für echte Bilder, False für Padding)
         Berechnet Durchschnitt der Features und ignoriert Padding (Nullen).
+        Nötig, um Signalstärke im Netzwerk konstant zu halten (bei versch. Anzahl an Richtungen).
         Fasse beliebig viele Input-Richtungen zu einem einzigen Feature-Tensor für den Decoder. 
+        Masked_average addiert helles und dunkles Signal und teilt durch 2 -> U-Net erhält nur noch ein diffuses, ungerichtetes Grau.
+        Das Netzwerk "vergisst", aus welcher Richtung das Signal ursprünglich kam, und erzeugt künstlich ein isotropes Signal ohne starke Richtungsabhängigkeit.
         """
         # Forme Maske um für Broadcasting: [B, N, 1, 1, 1, 1]
         mask_expanded = valid_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).float()
