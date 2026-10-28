@@ -24,5 +24,4 @@ Thumbs.db:encryptable
 *.pth
 *.pkl
 *.joblib
-Figures/interactive_bvecs.html
-Figures/training_loss_model_A.png
+Figures/
