@@ -7,3 +7,4 @@ scipy==1.18.1
 torch==2.14.1+cu130
 plotly==5.24.1
 nilearn==0.11.0
+dipy==1.12.0
