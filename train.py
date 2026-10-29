@@ -434,18 +434,33 @@ def main():
             target_meta_0 = meta_padded[:, 0:1, 0:7].expand(-1, meta_padded.shape[1], -1)
             meta_input_self[:, :, 7:14] = target_meta_0
 
+            # === Masken für b0 und DWI vor dem Loss berechnen ===
+            # Target b-Wert liegt an Index 7. Wegen der Normalisierung in dataset.py 
+            # müssen wir ihn für den Vergleich mit dem Threshold wieder mit 3000 multiplizieren.
+            target_bvals = meta_padded[:, 0, 7] * 3000.0
+            is_b0 = (target_bvals < config.B0_THRESHOLD)
+            is_dwi = ~is_b0            
+
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    # 1. PASS: Vorhersage der withheld Targets (Standard Super-Resolution)
+                    # 1. PASS: Vorhersage der withheld Targets
                     sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
-                    loss_sr = criterion(sr_out, hr_target, hr_mask)
                     
+                    # === Separierter und skalierter SR-Loss ===
+                    loss_sr = torch.tensor(0.0, device=device)
+                    
+                    if is_b0.any():
+                        loss_b0 = criterion(sr_out[is_b0], hr_target[is_b0], hr_mask[is_b0])
+                        loss_sr += config.WEIGHT_B0 * loss_b0
+                    
+                    if is_dwi.any():
+                        loss_dwi = criterion(sr_out[is_dwi], hr_target[is_dwi], hr_mask[is_dwi])
+                        loss_sr += config.WEIGHT_DWI * loss_dwi
+
                     # 2. PASS: Vorhersage der 0-ten Input-DWI in HR (für DC)
                     lr_to_hr = model(x_dwi_padded, x_b0, meta_input_self, valid_mask_dwi, valid_mask_b0)
-                    
-                    # Degradiere die Vorhersage und vergleiche NUR mit dem 0-ten LR-Input
                     pred_lr = degradation(lr_to_hr)
-                    lr_target_0 = x_dwi_padded[:, 0]  # [B, 1, D_lr, H_lr, W_lr] (5D)
+                    lr_target_0 = x_dwi_padded[:, 0]
                     
                     diff = torch.abs(pred_lr - lr_target_0)
                     mask_brain_lr = hr_mask[:, :, ::config.DOWNSCALE_FACTOR, ::config.DOWNSCALE_FACTOR, ::config.DOWNSCALE_FACTOR]
@@ -460,7 +475,12 @@ def main():
             else:
                 # Dasselbe nochmal ohne AMP
                 sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
-                loss_sr = criterion(sr_out, hr_target, hr_mask)
+                
+                loss_sr = torch.tensor(0.0, device=device)
+                if is_b0.any():
+                    loss_sr += config.WEIGHT_B0 * criterion(sr_out[is_b0], hr_target[is_b0], hr_mask[is_b0])
+                if is_dwi.any():
+                    loss_sr += config.WEIGHT_DWI * criterion(sr_out[is_dwi], hr_target[is_dwi], hr_mask[is_dwi])
                 
                 lr_to_hr = model(x_dwi_padded, x_b0, meta_input_self, valid_mask_dwi, valid_mask_b0)
                 pred_lr = degradation(lr_to_hr)
@@ -477,8 +497,28 @@ def main():
                 
             epoch_loss += loss_sr.item() # Loggt den reinen SR-Loss passend zur Validation-Kurve
             
+            # === Getrennte SR-Losses für Logging berechnen ===
+            with torch.no_grad():
+                if is_b0.any():
+                    b0_loss_val = criterion(sr_out[is_b0], hr_target[is_b0], hr_mask[is_b0]).item()
+                else:
+                    b0_loss_val = 0.0
+                    
+                if is_dwi.any():
+                    dwi_loss_val = criterion(sr_out[is_dwi], hr_target[is_dwi], hr_mask[is_dwi]).item()
+                else:
+                    dwi_loss_val = 0.0
+            
             if batch_idx % 10 == 0:
-                print(f"Epoch [{epoch}/{EPOCHS}], Batch [{batch_idx}/{len(train_loader)}], SR-Loss: {loss_sr.item():.4f}, DC-Loss: {loss_dc.item():.4f}")
+                print(f"Epoch [{epoch}/{EPOCHS}], Batch [{batch_idx}/{len(train_loader)}]")
+                print(f"  Gesamt SR-Loss: {loss_sr.item():.4f}")
+                
+                if is_b0.any():
+                    print(f"  -> b0 SR-Loss:  {b0_loss_val:.4f} (basierend auf {is_b0.sum().item()} Bildern)")
+                if is_dwi.any():
+                    print(f"  -> DWI SR-Loss: {dwi_loss_val:.4f} (basierend auf {is_dwi.sum().item()} Bildern)")
+                    
+                print(f"  -> DC-Loss:     {loss_dc.item():.4f}")
                 
         avg_train_loss = epoch_loss / len(train_loader)
         
@@ -499,6 +539,35 @@ def main():
             best_marker = ""
             
         print(f"==> Ende Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}{best_marker}\n")
+        # Bestes Modell abspeichern, wenn Val-Loss einen Rekord aufstellt
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), "Models/model_A_best.pth")
+            best_marker = " [* Best Val *]"
+        else:
+            best_marker = ""
+            
+        print(f"==> Ende Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}{best_marker}")
+
+        # === Checkpoint und Plot alle 20 Epochen speichern ===
+        CHECKPOINT_FREQ = 20
+        if epoch % CHECKPOINT_FREQ == 0:
+            ckpt_path = f"Models/model_A_epoch_{epoch}.pth"
+            plot_path = f"Figures/training_loss_model_A_epoch_{epoch}.png"
+            
+            # Modell-Gewichte für diese spezifische Epoche sichern
+            torch.save(model.state_dict(), ckpt_path)
+            
+            # Trainingsverlauf bis hierhin plotten
+            plot_training_loss(
+                train_loss_history, 
+                val_loss_history=val_loss_history, 
+                config=config, 
+                save_path=plot_path
+            )
+            print(f"  [Checkpoint] Status gesichert: {ckpt_path} und {plot_path}\n")
+        else:
+            print()
 
     # === MODELL SPEICHERN UND PLOTTEN (mit beiden Kurven) ===
     plot_training_loss(
