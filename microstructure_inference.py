@@ -9,7 +9,7 @@ anhand von Signal-Metriken sowie DIPY-Mikrostrukturkarten (FA, MD, DKI).
 Das U-Net (Modell A) mittelt im Bottleneck durch die masked_average-Operation alle unterschiedlichen Eingaberichtungen pro Voxel
 zu einem einzigen Durchschnittswert zusammen und löscht damit die Information, in welcher Raumrichtung das Signal stark oder schwach war.
 Dadurch sagt der Decoder für alle gesuchten Zielwinkel nahezu dasselbe, richtungslose (isotrope) Durchschnittsbild voraus,
-weshalb richtungsabhängige Werte wie die Fractional Anisotropy (FA) und die fODFs komplett einbrechen.
+weshalb richtungsabhängige Werte wie die Fractional Anisotropy (FA) und die fODFs (fiber orientation density function) komplett einbrechen.
 """
 
 import os
@@ -431,6 +431,10 @@ def main():
     print(f"fODF   MAE            | U-Net: {fodf_mae_unet:.5f} | SH: {fodf_mae_sh:.5f}")
 
     print("============================================================")
+    # 9. Speichern der generierten 4D-DWI-Volumina als NIfTI
+    nib.save(nib.Nifti1Image(hr_dwi_gt_phys.astype(np.float32), affine), "Results/DWI_GT.nii.gz")
+    nib.save(nib.Nifti1Image(hr_dwi_unet_phys.astype(np.float32), affine), "Results/DWI_UNet.nii.gz")
+    nib.save(nib.Nifti1Image(hr_dwi_sh_phys.astype(np.float32), affine), "Results/DWI_SH.nii.gz")
     print("Alle NIfTI-Karten (inkl. fODF) wurden im Ordner 'Results/' gespeichert.")
 
 if __name__ == "__main__":
