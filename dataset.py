@@ -240,9 +240,10 @@ class FlexibleDiffusionSampler:
         fig.write_html(html_file)
         print(f"Interaktive Kugel gespeichert unter: {html_file}")
 
-    def sample(self, num_targets=1, plot=False, rng=None, n_dwi=None):
+    def sample(self, num_targets=1, plot=False, rng=None, n_dwi=None, p_b0_target=0.1):
         """
-        Zieht DWI-Bilder (optimiert) und b0-Bilder (zufällig).
+        Zieht DWI-Bilder (optimiert mit electrostatic repulsion) und b0-Bilder (zufällig).
+        Als Targets werden danach mit 10% b0-Bilder gezogen und sonst DWI-Bilder.
         """
         if rng is None:
             rng = np.random
@@ -253,33 +254,50 @@ class FlexibleDiffusionSampler:
         n_b0 = rng.randint(1, min(max_b0, self.num_total_b0) + 1) if max_b0 > 1 else 1
             
         all_local_dwi = np.arange(self.num_total_dwi)
+        all_local_b0 = np.arange(self.num_total_b0)
         
-        # Elektrostatisch optimierte Ziehung für DWI
+        # 1. Inputs ziehen
         input_indices = self._electrostatic_subset_selection(all_local_dwi, n_dwi, rng=rng)
+        selected_b0 = rng.choice(all_local_b0, size=n_b0, replace=False)
 
-        # Disjunkte Trennung: Rest-DWIs als withheld targets
-        remaining_dwi_indices = np.setdiff1d(all_local_dwi, input_indices, assume_unique=True)
-        withheld_target_indices = rng.choice(
-            remaining_dwi_indices, size=num_targets, replace=False
-        )
+        # 2. Rest-Pools für Targets ermitteln (Disjunkte Trennung)
+        remaining_dwi = np.setdiff1d(all_local_dwi, input_indices, assume_unique=True)
+        remaining_b0 = np.setdiff1d(all_local_b0, selected_b0, assume_unique=True)
+        
+        target_vols_info = []
+        target_bvals = []
+        target_bvecs = []
+        
+        # 3. Targets ziehen
+        for _ in range(num_targets):
+            # 10% Wahrscheinlichkeit für b0 (sofern noch b0s verfügbar sind)
+            if len(remaining_b0) > 0 and rng.uniform() < p_b0_target:
+                idx = rng.choice(remaining_b0)
+                target_vols_info.append(('b0', idx))
+                remaining_b0 = np.setdiff1d(remaining_b0, [idx], assume_unique=True)
+                target_bvals.append(self.b0_bvals[idx])
+                target_bvecs.append(np.array([0.0, 0.0, 0.0], dtype=np.float32)) # Dummy-bvec
+            else:
+                idx = rng.choice(remaining_dwi)
+                target_vols_info.append(('dwi', idx))
+                remaining_dwi = np.setdiff1d(remaining_dwi, [idx], assume_unique=True)
+                target_bvals.append(self.dwi_bvals[idx])
+                target_bvecs.append(self.dwi_bvecs[idx])
         
         if plot:
             self.plot_bvecs_on_sphere(self.dwi_bvecs[input_indices])
         
-        # b0-Bilder können weiterhin random gezogen werden, da sie keine Richtungs-Info (bvec=0,0,0) haben
-        selected_b0 = rng.choice(self.num_total_b0, size=n_b0, replace=False)
-        
         return {
             'b0_indices': selected_b0,
             'input_indices': input_indices,
-            'withheld_target_indices': withheld_target_indices,
+            'target_vols_info': target_vols_info,
             'n_dwi': n_dwi,
             'n_b0': n_b0,
             'b0_bvals': self.b0_bvals[selected_b0],
             'input_bvals': self.dwi_bvals[input_indices],
             'input_bvecs': self.dwi_bvecs[input_indices],
-            'target_bvals': self.dwi_bvals[withheld_target_indices],
-            'target_bvecs': self.dwi_bvecs[withheld_target_indices]
+            'target_bvals': np.array(target_bvals, dtype=np.float32),
+            'target_bvecs': np.array(target_bvecs, dtype=np.float32)
         }
 
 def calculate_normalization_scalar(b0_volumes, brain_mask):
@@ -332,7 +350,7 @@ def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_thre
     print(f"Alle {len(subjects_cache)} Probanden erfolgreich geladen und gecached.")
     return subjects_cache
 
-def extract_random_patch(hr_data_b0, hr_data_dwi, mask, b0_indices, input_indices, withheld_target_indices, patch_size=64, fixed_center=None, min_brain_fraction=0.8):
+def extract_random_patch(hr_data_b0, hr_data_dwi, mask, b0_indices, input_indices, target_vols_info, patch_size=64, fixed_center=None, min_brain_fraction=0.8):
     """
     Sucht eine gültige Zentrumskoordinate innerhalb der Gehirnmaske und 
     extrahiert einen 3D-Block (Patch), der mindestens zu `min_brain_fraction` 
@@ -392,12 +410,19 @@ def extract_random_patch(hr_data_b0, hr_data_dwi, mask, b0_indices, input_indice
         input_indices                                  
     ]
 
-    hr_target = hr_data_dwi[
-        cx - half_patch : cx + half_patch, 
-        cy - half_patch : cy + half_patch, 
-        cz - half_patch : cz + half_patch, 
-        withheld_target_indices
-    ]
+    target_vols = []
+    for vol_type, idx in target_vols_info:
+        if vol_type == 'b0':
+            vol = hr_data_b0[cx - half_patch : cx + half_patch,
+                             cy - half_patch : cy + half_patch,
+                             cz - half_patch : cz + half_patch, idx]
+        else:
+            vol = hr_data_dwi[cx - half_patch : cx + half_patch,
+                              cy - half_patch : cy + half_patch,
+                              cz - half_patch : cz + half_patch, idx]
+        target_vols.append(vol[..., np.newaxis])
+        
+    hr_target = np.concatenate(target_vols, axis=-1)
 
     return hr_patch_b0, hr_patch_dwi, hr_target, hr_mask
 
@@ -595,7 +620,7 @@ class HCPPatchDataset(Dataset):
         # 1. Daten extrahieren (inklusive exakt zugeschnittenem hr_mask-Patch)
         hr_patch_b0, hr_patch_dwi, hr_target, hr_mask = extract_random_patch(
             subj['b0'], subj['dwi'], subj['mask'], 
-            s['b0_indices'], s['input_indices'], s['withheld_target_indices'], 
+            s['b0_indices'], s['input_indices'], s['target_vols_info'], 
             self.patch_size, fixed_center=fixed_center
         )
         
