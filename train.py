@@ -15,6 +15,30 @@ from utils import plot_training_loss
 # 1. BAUSTEINE FÜR MODEL A 
 # ==========================================
 
+class DegradationLayer(nn.Module):
+    def __init__(self, sigma=0.8, downscale_factor=2):
+        super().__init__()
+        self.downscale_factor = downscale_factor
+        
+        # Erstelle einen 3D-Gauss-Kernel passend zu scipy.ndimage.gaussian_filter
+        kernel_size = int(2 * np.ceil(2 * sigma) + 1) # meist 5x5x5 bei sigma=0.8
+        coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g = g / g.sum()
+        
+        # 3D-Kernel bauen: [1, 1, K, K, K]
+        kernel_3d = g[:, None, None] * g[None, :, None] * g[None, None, :]
+        kernel_3d = kernel_3d.unsqueeze(0).unsqueeze(0)
+        self.register_buffer("kernel", kernel_3d)
+        self.padding = kernel_size // 2
+
+    def forward(self, hr_batch):
+        # hr_batch: [B, 1, D, H, W]
+        blurred = F.conv3d(hr_batch, self.kernel, padding=self.padding)
+        # Subsampling durch Slicing
+        lr_batch = blurred[:, :, ::self.downscale_factor, ::self.downscale_factor, ::self.downscale_factor]
+        return lr_batch
+
 class ResBlock3D(nn.Module):
     """Residual Block mit 3x3x3 Conv, SiLU, ohne Normalisierung."""
     def __init__(self, channels):
@@ -343,13 +367,15 @@ def main():
         is_validation=True
     )
     
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, 
+                              num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, 
+                            num_workers=0, pin_memory=True)
     
     model = ModelA_FlexibleSR(meta_dim=14).to(device)
 
-    # 50% SSIM + 50% L1 (Guter Kompromiss für scharfe Kanten + quantitative Treue)
-    criterion = Masked3DSSIMAndL1Loss(window_size=7, data_range=1.0, alpha=0.5).to(device)
+    # Starte mit reinem L1 Loss (alpha=0.0)
+    criterion = Masked3DSSIMAndL1Loss(window_size=7, data_range=1.0, alpha=0.0).to(device)
 
     # Adam + Decoupled Weight Decay (schützt vor Overfitting)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4) 
@@ -366,12 +392,22 @@ def main():
     val_loss_history = []
     best_val_loss = float('inf')
     
-    
+    degradation = DegradationLayer(sigma=0.8, downscale_factor=config.DOWNSCALE_FACTOR).to(device)
+    LAMBDA_DC = 0.5  # Gewichtung für den Data Consistency Loss
+
+    global_step = 0
+
     for epoch in range(1, EPOCHS + 1):
         model.train()
         epoch_loss = 0.0
         
         for batch_idx, batch_data in enumerate(train_loader):
+            global_step += 1
+
+            if global_step == 500:
+                criterion.alpha = 0.5
+                print(f"\n[Update {global_step}] Loss-Funktion umgestellt auf 50% SSIM + 50% L1 (alpha=0.5)\n")
+
             x_b0, x_dwi_padded, meta_padded, valid_mask_dwi, valid_mask_b0, hr_target, hr_mask = batch_data
             
             x_b0 = x_b0.to(device)
@@ -387,29 +423,69 @@ def main():
 
             optimizer.zero_grad()
             
+            # --- Metadaten der INPUT-Richtungen für den DC-Term bauen ---
+            # Für den DC-Term: Ziel = dem Input. 
+            # Wir kopieren die Input-Metadaten (Indizes 0-6) auf die Target-Metadaten (Indizes 7-13).
+            # meta_padded: Die ersten 7 Werte beschreiben die Eingaberichtung (Ist-Zustand), die letzten 7 beschreiben die unbekannte Zielrichtung (Soll-Zustand).
+            # meta_input_self: Kopiert Tensor und ersetzt die Ziel-Werte durch die Eingabe-Werte.
+            # Index 0 ist immer ein gültiger Input-Kanal (kein Padding)
+            # Wir setzen die Input-Richtung 0 als gemeinsames Target für ALLE Kanäle:
+            meta_input_self = meta_padded.clone()
+            target_meta_0 = meta_padded[:, 0:1, 0:7].expand(-1, meta_padded.shape[1], -1)
+            meta_input_self[:, :, 7:14] = target_meta_0
+
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
+                    # 1. PASS: Vorhersage der withheld Targets (Standard Super-Resolution)
                     sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
-                    loss = criterion(sr_out, hr_target, hr_mask)
+                    loss_sr = criterion(sr_out, hr_target, hr_mask)
+                    
+                    # 2. PASS: Vorhersage der 0-ten Input-DWI in HR (für DC)
+                    lr_to_hr = model(x_dwi_padded, x_b0, meta_input_self, valid_mask_dwi, valid_mask_b0)
+                    
+                    # Degradiere die Vorhersage und vergleiche NUR mit dem 0-ten LR-Input
+                    pred_lr = degradation(lr_to_hr)
+                    lr_target_0 = x_dwi_padded[:, 0]  # [B, 1, D_lr, H_lr, W_lr] (5D)
+                    
+                    diff = torch.abs(pred_lr - lr_target_0)
+                    mask_brain_lr = hr_mask[:, :, ::config.DOWNSCALE_FACTOR, ::config.DOWNSCALE_FACTOR, ::config.DOWNSCALE_FACTOR]
+                    loss_dc = (diff * mask_brain_lr).sum() / (mask_brain_lr.sum() + 1e-8)
+
+                    # Gesamt-Loss
+                    loss = loss_sr + LAMBDA_DC * loss_dc
                 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                # Dasselbe nochmal ohne AMP
                 sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
-                loss = criterion(sr_out, hr_target, hr_mask)
+                loss_sr = criterion(sr_out, hr_target, hr_mask)
+                
+                lr_to_hr = model(x_dwi_padded, x_b0, meta_input_self, valid_mask_dwi, valid_mask_b0)
+                pred_lr = degradation(lr_to_hr)
+                lr_target_0 = x_dwi_padded[:, 0]  # [B, 1, D_lr, H_lr, W_lr] (5D)
+                
+                diff = torch.abs(pred_lr - lr_target_0)
+                mask_brain_lr = hr_mask[:, :, ::config.DOWNSCALE_FACTOR, ::config.DOWNSCALE_FACTOR, ::config.DOWNSCALE_FACTOR]
+                loss_dc = (diff * mask_brain_lr).sum() / (mask_brain_lr.sum() + 1e-8)
+                
+                loss = loss_sr + LAMBDA_DC * loss_dc
+                
                 loss.backward()
                 optimizer.step()
                 
-            epoch_loss += loss.item()
+            epoch_loss += loss_sr.item() # Loggt den reinen SR-Loss passend zur Validation-Kurve
             
             if batch_idx % 10 == 0:
-                print(f"Epoch [{epoch}/{EPOCHS}], Batch [{batch_idx}/{len(train_loader)}], Loss: {loss.item():.4f}")
+                print(f"Epoch [{epoch}/{EPOCHS}], Batch [{batch_idx}/{len(train_loader)}], SR-Loss: {loss_sr.item():.4f}, DC-Loss: {loss_dc.item():.4f}")
                 
         avg_train_loss = epoch_loss / len(train_loader)
         
         # ---  VALIDATION ---
         avg_val_loss = validate(model, val_loader, criterion, device, use_amp=(scaler is not None))
+        # bookmark: soll der validate loss auch den DC-Term enthalten, oder nur den "normalen" loss, weil das eig. Ziel SR ist?
+        # DC-Loss als Hilfsmittel zum Training, oder als fester Loss-Term?
         
         train_loss_history.append(avg_train_loss)
         val_loss_history.append(avg_val_loss)
