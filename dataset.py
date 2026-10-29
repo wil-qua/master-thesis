@@ -369,10 +369,13 @@ def extract_random_patch(hr_data_b0, hr_data_dwi, mask, b0_indices, input_indice
                     cy - half_patch : cy + half_patch, 
                     cz - half_patch : cz + half_patch
                 ]
-                
+                # sampling balancing, untersch. hirnregionen untersch. gewichtet, mitte wird höher gewichtet!! vllt sampling (ziehen aus rändern)
+                # anpassen
+                # bewusstsein dafür haben
+                # vergleiche fehler in versch. bereichen
                 # Nur akzeptieren, wenn mindestens X% (z.B. 80%) im Gehirn liegen
-                if np.mean(hr_mask > 0) >= min_brain_fraction:
-                    break 
+                if np.mean(hr_mask > 0) >= min_brain_fraction:  # BOOKMARK: schaue, wie viel leere pixel insg in FOV drin sind
+                    break  # wie viele CSF (Flüssigkeit), schwarz in dMRI, gewebe vs wasser
 
     # Patches aus b0 und DWI herausschneiden (erst wenn gültiges Zentrum gefunden wurde)
     hr_patch_b0 = hr_data_b0[
@@ -458,7 +461,7 @@ def generate_and_augment_lr_patch(
     rot_spec=None, 
     downscale_factor=2, 
     sigma=0.8, 
-    noise_std=0.0  # 0.01, jetzt erstmal ausgeschaltet
+    noise_std=0.0  # 0.01, jetzt erstmal ausgeschaltet, da HCP Daten bereits processed sind und noise bereits korrigiert wurde
 ):
     """
     - Verlustfreie 90°-Rotation von Bild, Maske und Gradienten (bvecs)
