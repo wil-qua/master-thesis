@@ -32,7 +32,7 @@ from dataset import (
 from train import ModelA_FlexibleSR
 from sh_reference import RegularizedSHBaseline
 
-
+n_input_dwi = 30
 # ===========================================================
 # 1. INFERENCE HILFSFUNKTIONEN (Sliding Window Stitching)
 # ===========================================================
@@ -92,6 +92,9 @@ def predict_volume_unet(
 
     hr_predictions = np.zeros((X_hr, Y_hr, Z_hr, n_targets), dtype=np.float32)
 
+    # Für die EINE aktuelle Zielrichtung t_idx: ganzes Gehirn Patch für Patch abfahren.
+    # Pro Position (x, y, z): 30 Input-Richtungen dieses Ausschnitts -> 1 HR-Patch dieser Richtung.
+    # Danach werden alle Patches zu einem Volumen zusammengefügt und die überlappenden Patches gemittelt, dann kommt die nächste Richtung.
     for t_idx in range(n_targets):
         # Metadaten für Target t_idx aufbauen
         t_bval = target_bvals[t_idx] / 3000.0
@@ -141,7 +144,8 @@ def predict_volume_sh(lr_dwi, input_bvecs, target_bvecs, downscale_factor=2, lam
     lr_dwi: [X_lr, Y_lr, Z_lr, N_dwi]
     """
     n_dwi = lr_dwi.shape[-1]
-    lmax = 4 if n_dwi >= 15 else 2
+    # lmax = 4 if n_dwi >= 15 else 2
+    lmax = 2 # für konsistenten Vergleich zwischen versch. Anzahlen an inputs
 
     sh_model = RegularizedSHBaseline(lmax=lmax, lambda_reg=lambda_reg, spatial_scale=float(downscale_factor))
 
@@ -255,12 +259,31 @@ def main():
     )
     rng = np.random.RandomState(42)
     
-    n_input_dwi = 30
-    # Berechnen, wie viele Richtungen in der Schale nach Abzug der 18 Inputs maximal übrig bleiben:
-    max_available_targets = len(sampler.global_dwi_indices) - n_input_dwi
-    print(f"Insgesamt {len(sampler.global_dwi_indices)} DWIs in der Schale -> Nutze {n_input_dwi} als Input und alle {max_available_targets} übrigen als Targets.")
+    # Fester Split: 30er Input-Pool und 60 feste Targets (von insgesamt 90 DWIs)
+    max_available_targets = 60
+    print(f"Insgesamt {len(sampler.global_dwi_indices)} DWIs in der Schale -> Nutze {n_input_dwi} als Input und feste {max_available_targets} als Targets.")
 
-    sample_spec = sampler.sample(num_targets=max_available_targets, plot=False, rng=rng, n_dwi=n_input_dwi)
+    # 1. Einmalig den Basis-Split (30 Input-Pool / 60 feste Targets) ziehen
+    base_spec = sampler.sample(
+        num_targets=max_available_targets, 
+        plot=False, 
+        rng=rng, 
+        n_dwi=30, 
+        p_b0_target=0.0
+    )
+
+    # 2. Falls n_input_dwi < 30 (z.B. 15), aus dem 30er-Pool die besten n_input_dwi auswählen.
+    # Die 60 Targets bleiben dadurch exakt gleich wie beim Lauf mit n_input_dwi = 30!
+    if n_input_dwi < 30:
+        sub_input_indices = sampler._electrostatic_subset_selection(
+            base_spec["input_indices"], n_input_dwi, rng=rng
+        )
+        base_spec["input_indices"] = sub_input_indices
+        base_spec["input_bvals"] = sampler.dwi_bvals[sub_input_indices]
+        base_spec["input_bvecs"] = sampler.dwi_bvecs[sub_input_indices]
+        base_spec["n_dwi"] = n_input_dwi
+
+    sample_spec = base_spec
 
     b0_full = full_data[..., sampler.global_b0_indices]
     dwi_full = full_data[..., sampler.global_dwi_indices]
@@ -287,10 +310,16 @@ def main():
     
     sl = (slice(0, max_x), slice(0, max_y), slice(0, max_z))
 
+    target_dwi_indices = [idx for _, idx in sample_spec["target_vols_info"]]
+
+    assert np.allclose(sampler.dwi_bvecs[sample_spec["input_indices"]], sample_spec["input_bvecs"])
+    assert np.allclose(sampler.dwi_bvecs[target_dwi_indices], sample_spec["target_bvecs"])
+    assert not set(sample_spec["input_indices"]) & set(target_dwi_indices)
+
     hr_mask = brain_mask_full[sl]
     hr_b0_in = b0_norm[sl + (sample_spec["b0_indices"],)]
     hr_dwi_in = dwi_norm[sl + (sample_spec["input_indices"],)]
-    hr_dwi_gt = dwi_norm[sl + (sample_spec["withheld_target_indices"],)]
+    hr_dwi_gt = dwi_norm[sl + (target_dwi_indices,)]
 
     # 3. Künstliche LR-Degradation (Blur + Downsampling) erzeugen
     dummy_bvecs = np.zeros((hr_b0_in.shape[-1], 3))
@@ -313,7 +342,7 @@ def main():
     # 4. Rekonstruktion 1: U-Net (Model A)
     print("\nStarte U-Net Rekonstruktion...")
     model = ModelA_FlexibleSR(meta_dim=14).to(device)
-    model_path = "Models/model_A.pth"
+    model_path = "Models/model_A_best.pth"
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
         print(f"Gewichte geladen aus: {model_path}")
@@ -363,13 +392,13 @@ def main():
 
     print("Berechne DIPY Mikrostruktur für U-Net...")
     metrics_unet = compute_dipy_microstructure(
-        hr_dwi_unet_phys, hr_b0_interp_phys, sample_spec["target_bvals"],
+        hr_dwi_unet_phys, hr_b0_gt_phys, sample_spec["target_bvals"],
         sample_spec["target_bvecs"], sample_spec["b0_bvals"], hr_mask
     )
 
     print("Berechne DIPY Mikrostruktur für SH-Baseline...")
     metrics_sh = compute_dipy_microstructure(
-        hr_dwi_sh_phys, hr_b0_interp_phys, sample_spec["target_bvals"],
+        hr_dwi_sh_phys, hr_b0_gt_phys, sample_spec["target_bvals"],
         sample_spec["target_bvecs"], sample_spec["b0_bvals"], hr_mask
     )
 
@@ -386,8 +415,8 @@ def main():
 
     # 2. Volumina (b0 + DWI) zusammenfügen und negative Ausreißer clippen
     vol_gt = np.clip(np.concatenate([hr_b0_gt_phys, hr_dwi_gt_phys], axis=-1), a_min=0.0, a_max=None)
-    vol_unet = np.clip(np.concatenate([hr_b0_interp_phys, hr_dwi_unet_phys], axis=-1), a_min=0.0, a_max=None)
-    vol_sh = np.clip(np.concatenate([hr_b0_interp_phys, hr_dwi_sh_phys], axis=-1), a_min=0.0, a_max=None)
+    vol_unet = np.clip(np.concatenate([hr_b0_gt_phys, hr_dwi_unet_phys], axis=-1), a_min=0.0, a_max=None)
+    vol_sh = np.clip(np.concatenate([hr_b0_gt_phys, hr_dwi_sh_phys], axis=-1), a_min=0.0, a_max=None)
 
     print("Berechne Response Function auf Ground Truth...")
     # Response Function NUR auf der Ground Truth schätzen!
@@ -418,7 +447,8 @@ def main():
     for m_name in metrics_gt.keys():
         mae_unet = compute_masked_mae(metrics_unet[m_name], metrics_gt[m_name], hr_mask)
         mae_sh = compute_masked_mae(metrics_sh[m_name], metrics_gt[m_name], hr_mask)
-        print(f"{m_name:6s} MAE            | U-Net: {mae_unet:.5f} | SH: {mae_sh:.5f}")
+        scale = 1e3 if m_name == "MD" else 1.0
+        print(f"{m_name:6s} MAE            | U-Net: {mae_unet*scale:.5f} | SH: {mae_sh*scale:.5f}")
 
         # Als NIfTI speichern
         nib.save(nib.Nifti1Image(metrics_gt[m_name].astype(np.float32), affine), f"Results/{m_name}_GT.nii.gz")
@@ -431,10 +461,36 @@ def main():
     print(f"fODF   MAE            | U-Net: {fodf_mae_unet:.5f} | SH: {fodf_mae_sh:.5f}")
 
     print("============================================================")
+
+    # Prüft die Standardabweichung über die {max_available_targets} Richtungen innerhalb der Gehirnmaske:
+    print(f"Winkel-Varianz (Std über {max_available_targets} Richtungen):")
+    print(f"  GT   : {np.std(hr_dwi_gt[hr_mask], axis=-1).mean():.5f}")
+    print(f"  U-Net: {np.std(hr_dwi_unet[hr_mask], axis=-1).mean():.5f}")
+    print(f"  SH   : {np.std(hr_dwi_sh[hr_mask], axis=-1).mean():.5f}")
     # 9. Speichern der generierten 4D-DWI-Volumina als NIfTI
     nib.save(nib.Nifti1Image(hr_dwi_gt_phys.astype(np.float32), affine), "Results/DWI_GT.nii.gz")
     nib.save(nib.Nifti1Image(hr_dwi_unet_phys.astype(np.float32), affine), "Results/DWI_UNet.nii.gz")
     nib.save(nib.Nifti1Image(hr_dwi_sh_phys.astype(np.float32), affine), "Results/DWI_SH.nii.gz")
+
+    # 9. Speichern der kompletten 4D-Volumina (b0 + DWI) inkl. bvals/bvecs für DSI Studio
+    nib.save(nib.Nifti1Image(vol_gt.astype(np.float32), affine), "Results/DSI_GT.nii.gz")
+    nib.save(nib.Nifti1Image(vol_unet.astype(np.float32), affine), "Results/DSI_UNet.nii.gz")
+    nib.save(nib.Nifti1Image(vol_sh.astype(np.float32), affine), "Results/DSI_SH.nii.gz")
+    
+    # Gehirnmaske für DSI Studio mitexportieren
+    nib.save(nib.Nifti1Image(hr_mask.astype(np.uint8), affine), "Results/nodif_brain_mask.nii.gz")
+
+    # Zugehörige bval- und bvec-Tabelle speichern (für alle 3 identisch)
+    np.savetxt("Results/DSI_UNet.bval", full_bvals[None, :], fmt="%.1f")
+    np.savetxt("Results/DSI_UNet.bvec", full_bvecs.T, fmt="%.6f")
+    np.savetxt("Results/DSI_GT.bval", full_bvals[None, :], fmt="%.1f")
+    np.savetxt("Results/DSI_GT.bvec", full_bvecs.T, fmt="%.6f")
+    np.savetxt("Results/DSI_SH.bval", full_bvals[None, :], fmt="%.1f")
+    np.savetxt("Results/DSI_SH.bvec", full_bvecs.T, fmt="%.6f")
+
+    sigma = np.std(hr_b0_in[hr_mask], axis=-1, ddof=1).mean()
+    print(f"Rauschboden MAE ≈ {0.8*sigma:.4f}")
+    wm = hr_mask & (metrics_gt["FA"] > 0.4)
     print("Alle NIfTI-Karten (inkl. fODF) wurden im Ordner 'Results/' gespeichert.")
 
 if __name__ == "__main__":
