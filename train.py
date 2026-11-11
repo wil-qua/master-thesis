@@ -5,6 +5,7 @@ import torch.optim as optim
 import numpy as np
 from torch.utils.data import DataLoader
 import os
+import wandb
 
 # Import der eigenen Module
 import config
@@ -281,15 +282,46 @@ class Masked3DSSIMAndL1Loss(nn.Module):
 
         return self.alpha * masked_ssim_loss + (1.0 - self.alpha) * masked_l1_loss
 
-def validate(model, val_loader, criterion, device, use_amp=False):
-    """Führt die Validation auf den Validierungs-Probanden durch."""
+
+def validate(
+    model,
+    val_loader,
+    criterion,
+    device,
+    use_amp=False,
+    weight_b0=1.0,
+    weight_dwi=1.0,
+    b0_threshold=100
+):
+    """
+    Validation mit getrenntem b0- und DWI-SR-Loss.
+
+    Der gesamte Validation SR Loss wird mit denselben
+    Gewichten wie im Training berechnet.
+
+    Rückgabe:
+        sr_loss:       Gewichteter Gesamt-SR-Loss
+        b0_sr_loss:    Ungewichteter b0-Loss
+        dwi_sr_loss:   Ungewichteter DWI-Loss
+    """
+
     model.eval()
-    val_loss = 0.0
-    
+
+    val_sr_loss_sum = 0.0
+    val_b0_loss_sum = 0.0
+    val_dwi_loss_sum = 0.0
+
+    num_batches = 0
+    num_b0_batches = 0
+    num_dwi_batches = 0
+
     with torch.no_grad():
+
         for batch_data in val_loader:
+
             x_b0, x_dwi_padded, meta_padded, valid_mask_dwi, valid_mask_b0, hr_target, hr_mask = batch_data
-            
+
+            # Tensoren auf GPU / CPU verschieben
             x_b0 = x_b0.to(device)
             x_dwi_padded = x_dwi_padded.to(device)
             meta_padded = meta_padded.to(device)
@@ -300,18 +332,90 @@ def validate(model, val_loader, criterion, device, use_amp=False):
 
             if hr_mask.ndim == 4:
                 hr_mask = hr_mask.unsqueeze(1)
-            
-            if use_amp:
-                with torch.amp.autocast('cuda'):
-                    sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
-                    loss = criterion(sr_out, hr_target, hr_mask)
-            else:
-                sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
-                loss = criterion(sr_out, hr_target, hr_mask)
-                
-            val_loss += loss.item()
-            
-    return val_loss / len(val_loader)
+
+            # --------------------------------------
+            # b0- und DWI-Targets unterscheiden
+            # --------------------------------------
+
+            target_bvals = meta_padded[:, 0, 7] * 3000.0
+
+            is_b0 = target_bvals < b0_threshold
+            is_dwi = ~is_b0
+
+            # --------------------------------------
+            # Forward Pass und Loss-Berechnung
+            # --------------------------------------
+
+            with torch.amp.autocast(
+                device_type=device.type,
+                enabled=use_amp
+            ):
+
+                sr_out = model(
+                    x_dwi_padded,
+                    x_b0,
+                    meta_padded,
+                    valid_mask_dwi,
+                    valid_mask_b0
+                )
+
+                # Gewichteter Gesamt-SR-Loss
+                loss_sr = torch.tensor(0.0, device=device)
+
+                # Separater b0-Loss
+                if is_b0.any():
+
+                    loss_b0 = criterion(
+                        sr_out[is_b0],
+                        hr_target[is_b0],
+                        hr_mask[is_b0]
+                    )
+
+                    loss_sr += weight_b0 * loss_b0
+
+                    val_b0_loss_sum += loss_b0.item()
+                    num_b0_batches += 1
+
+                # Separater DWI-Loss
+                if is_dwi.any():
+
+                    loss_dwi = criterion(
+                        sr_out[is_dwi],
+                        hr_target[is_dwi],
+                        hr_mask[is_dwi]
+                    )
+
+                    loss_sr += weight_dwi * loss_dwi
+
+                    val_dwi_loss_sum += loss_dwi.item()
+                    num_dwi_batches += 1
+
+            # Gewichteten Gesamt-Loss akkumulieren
+            val_sr_loss_sum += loss_sr.item()
+            num_batches += 1
+
+    # --------------------------------------
+    # Durchschnittswerte berechnen
+    # --------------------------------------
+
+    avg_val_sr_loss = val_sr_loss_sum / num_batches
+
+    avg_val_b0_loss = (
+        val_b0_loss_sum / num_b0_batches
+        if num_b0_batches > 0 else float("nan")
+    )
+
+    avg_val_dwi_loss = (
+        val_dwi_loss_sum / num_dwi_batches
+        if num_dwi_batches > 0 else float("nan")
+    )
+
+    return {
+        "sr_loss": avg_val_sr_loss,
+        "b0_sr_loss": avg_val_b0_loss,
+        "dwi_sr_loss": avg_val_dwi_loss
+    }
+
 
 # ==========================================
 # 3. TRAINING LOOP
@@ -385,9 +489,7 @@ def main():
     scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
     
     # 4. TRAININGSSCHLEIFE
-    EPOCHS = config.NUM_EPOCHS
-    
-    print(f"\nStarte Training für {EPOCHS} Epochen...")
+    epoch = 0
     train_loss_history = []
     val_loss_history = []
     best_val_loss = float('inf')
@@ -396,10 +498,70 @@ def main():
     LAMBDA_DC = 0.5  # Gewichtung für den Data Consistency Loss
 
     global_step = 0
+    
+    # ==========================================
+    # WEIGHTS & BIASES EXPERIMENT TRACKING
+    # ==========================================
 
-    for epoch in range(1, EPOCHS + 1):
+    run = wandb.init(
+        project="master-thesis",
+        entity="william-quan18-uke",
+        name="ModelA_FlexibleSR_baseline",
+
+        config={
+            # Modell
+            "model": "ModelA_FlexibleSR",
+            "meta_dim": 14,
+
+            # Training
+            "optimizer": "AdamW",
+            "learning_rate": 1e-4,
+            "weight_decay": 1e-4,
+            "batch_size": config.BATCH_SIZE,
+            "patch_size": config.PATCH_SIZE,
+
+            # Daten
+            "downscale_factor": config.DOWNSCALE_FACTOR,
+            "max_measurements": config.MAX_MEASUREMENTS,
+            "num_patches_per_epoch": config.NUM_PATCHES_PER_EPOCH,
+            "b0_threshold": config.B0_THRESHOLD,
+            "min_dwi_b": config.MIN_DWI_B,
+            "max_dwi_b": config.MAX_DWI_B,
+
+            # Loss
+            "loss_function": "Masked3DSSIMAndL1Loss",
+            "initial_alpha": 0.0,
+            "alpha_after_step_500": 0.5,
+            "ssim_window_size": 7,
+
+            # Gewichtung der Loss-Komponenten
+            "weight_b0": config.WEIGHT_B0,
+            "weight_dwi": config.WEIGHT_DWI,
+            "lambda_dc": LAMBDA_DC,
+
+            # Degradation
+            "degradation_sigma": 0.8,
+
+            # Hardware
+            "amp_enabled": scaler is not None,
+        }
+    )
+
+    # Early Stopping
+    PATIENCE = 15       # Anzahl Epochen ohne Verbesserung
+    MIN_DELTA = 0.001   # Mindestverbesserung der Validation-Loss
+
+    epochs_without_improvement = 0
+    best_val_loss = float("inf")
+
+    TEST_RUN = False
+    TEST_EPOCHS = 2
+    while True:
+        epoch += 1
         model.train()
         epoch_loss = 0.0
+        epoch_dc_loss = 0.0
+        epoch_total_loss = 0.0
         
         for batch_idx, batch_data in enumerate(train_loader):
             global_step += 1
@@ -407,6 +569,9 @@ def main():
             if global_step == 500:
                 criterion.alpha = 0.5
                 print(f"\n[Update {global_step}] Loss-Funktion umgestellt auf 50% SSIM + 50% L1 (alpha=0.5)\n")
+
+                best_val_loss = float("inf")
+                epochs_without_improvement = 0
 
             x_b0, x_dwi_padded, meta_padded, valid_mask_dwi, valid_mask_b0, hr_target, hr_mask = batch_data
             
@@ -496,6 +661,8 @@ def main():
                 optimizer.step()
                 
             epoch_loss += loss_sr.item() # Loggt den reinen SR-Loss passend zur Validation-Kurve
+            epoch_dc_loss += loss_dc.item()
+            epoch_total_loss += loss.item()
             
             # === Getrennte SR-Losses für Logging berechnen ===
             with torch.no_grad():
@@ -510,7 +677,7 @@ def main():
                     dwi_loss_val = 0.0
             
             if batch_idx % 10 == 0:
-                print(f"Epoch [{epoch}/{EPOCHS}], Batch [{batch_idx}/{len(train_loader)}]")
+                print(f"Epoch [{epoch}], Batch [{batch_idx}/{len(train_loader)}]")
                 print(f"  Gesamt SR-Loss: {loss_sr.item():.4f}")
                 
                 if is_b0.any():
@@ -521,11 +688,38 @@ def main():
                 print(f"  -> DC-Loss:     {loss_dc.item():.4f}")
                 
         avg_train_loss = epoch_loss / len(train_loader)
+        avg_train_dc_loss = epoch_dc_loss / len(train_loader)
+        avg_train_total_loss = epoch_total_loss / len(train_loader)
         
-        # ---  VALIDATION ---
-        avg_val_loss = validate(model, val_loader, criterion, device, use_amp=(scaler is not None))
-        # bookmark: soll der validate loss auch den DC-Term enthalten, oder nur den "normalen" loss, weil das eig. Ziel SR ist?
-        # DC-Loss als Hilfsmittel zum Training, oder als fester Loss-Term?
+        # --- VALIDATION ---
+
+        val_metrics = validate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            use_amp=(scaler is not None),
+            weight_b0=config.WEIGHT_B0,
+            weight_dwi=config.WEIGHT_DWI,
+            b0_threshold=config.B0_THRESHOLD
+        )
+
+        # Early Stopping
+        if criterion.alpha == 0.5 and epochs_without_improvement >= PATIENCE:
+            print(
+                f"\nEarly Stopping nach Epoche {epoch}: "
+                f"Validation-Loss hat sich seit {PATIENCE} Epochen "
+                f"nicht ausreichend verbessert."
+            )
+            break
+
+        # Gewichteter Gesamt-SR-Loss
+        avg_val_loss = val_metrics["sr_loss"]
+
+        # Einzelne Loss-Komponenten
+        avg_val_b0_loss = val_metrics["b0_sr_loss"]
+        avg_val_dwi_loss = val_metrics["dwi_sr_loss"]
+
         
         train_loss_history.append(avg_train_loss)
         val_loss_history.append(avg_val_loss)
@@ -533,12 +727,39 @@ def main():
         # Bestes Modell abspeichern, wenn Val-Loss einen Rekord aufstellt
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            epochs_without_improvement = 0
             torch.save(model.state_dict(), "Models/model_A_best.pth")
             best_marker = " [* Best Val *]"
         else:
+            epochs_without_improvement += 1
             best_marker = ""
+
+
+        # ==========================================
+        # LOGGING TO WEIGHTS & BIASES
+        # ==========================================
+
+        run.log({
+            "epoch": epoch,
+
+            "train/sr_loss": avg_train_loss,
+
+            "val/sr_loss": avg_val_loss,
+            "val/b0_sr_loss": avg_val_b0_loss,
+            "val/dwi_sr_loss": avg_val_dwi_loss,
+
+            "val/best_sr_loss": best_val_loss
+        })
+
             
-        print(f"==> Ende Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}{best_marker}\n")
+        print(
+            f"==> Ende Epoch {epoch} | "
+            f"Train Loss: {avg_train_loss:.4f} | "
+            f"Val SR Loss: {avg_val_loss:.4f} | "
+            f"Val b0: {avg_val_b0_loss:.4f} | "
+            f"Val DWI: {avg_val_dwi_loss:.4f}"
+            f"{best_marker}\n"
+        )
         # Bestes Modell abspeichern, wenn Val-Loss einen Rekord aufstellt
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -548,7 +769,9 @@ def main():
             best_marker = ""
             
         print(f"==> Ende Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}{best_marker}")
-
+        if TEST_RUN and epoch >= TEST_EPOCHS:
+            print(f"\nTestlauf nach {TEST_EPOCHS} Epochen beendet.")
+            break
         # === Checkpoint und Plot alle 20 Epochen speichern ===
         CHECKPOINT_FREQ = 20
         if epoch % CHECKPOINT_FREQ == 0:
@@ -580,6 +803,8 @@ def main():
     save_path = "Models/model_A.pth"
     torch.save(model.state_dict(), save_path)
     print(f"\nFinales Modell gespeichert unter: {save_path} (Bestes Val-Modell unter: model_A_best.pth)")
+
+    run.finish()
 
 if __name__ == "__main__":
     main()
