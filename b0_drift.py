@@ -3,10 +3,11 @@ import nibabel as nib
 import numpy as np
 
 # 1. Daten und bvals laden
+proband = "765864"
 main_path = "/mnt/nas_io/anarchy/lohrd/MRI_data/HCP/Diffusion/3T/"
-data_path = main_path + "100610/T1w/Diffusion/data.nii.gz"
-bvals_path = main_path + "100610/T1w/Diffusion/bvals"
-mask_path = main_path + "100610/T1w/Diffusion/nodif_brain_mask.nii.gz"
+data_path = main_path + proband + "/T1w/Diffusion/data.nii.gz"
+bvals_path = main_path + proband + "/T1w/Diffusion/bvals"
+mask_path = main_path + proband + "/T1w/Diffusion/nodif_brain_mask.nii.gz"
 output_mask_path = "b0_top1_percent_mask.nii.gz"
 
 img = nib.load(data_path)
@@ -57,7 +58,7 @@ plt.plot(
 plt.axhline(100, linestyle="--", color="gray")
 plt.xlabel("b0-Volume (Reihenfolge)")
 plt.ylabel("Mittleres Signal (% des ersten b0)")
-plt.title("Signalverlauf der b0-Volumes")
+plt.title(f"Signalverlauf der b0-Volumes für Proband {proband}")
 plt.grid(alpha=0.3)
 plt.tight_layout()
-plt.savefig('Figures/b0_Drift_Differenz.png', dpi=300)
+plt.savefig(f'Figures/b0_Drift_Differenz_{proband}.png', dpi=300)
