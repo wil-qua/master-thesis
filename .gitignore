@@ -3,6 +3,7 @@
 .venvs/
 .venv/
 venv/
+wandb/
 __pycache__/
 *.py[cod]
 
@@ -18,10 +19,21 @@ Thumbs.db:encryptable
 # Große wissenschaftliche Daten und Modelle
 *.nii
 *.nii.gz
-*.h5
+*.h5s
 *.hdf5
 *.pt
 *.pth
 *.pkl
 *.joblib
 Figures/
+*.Identifier
+
+# Helper-files
+*.html
+*bval
+*bvec
+*sz
+test_script.py
+test.txt
+*.docx
+*.csv
