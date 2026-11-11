@@ -30,9 +30,9 @@ Figures/
 
 # Helper-files
 *.html
-*bval
-*bvec
-*sz
+*.bval
+*.bvec
+*.sz
 test_script.py
 test.txt
 *.docx
