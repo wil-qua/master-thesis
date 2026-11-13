@@ -19,9 +19,12 @@ WEIGHT_B0 = 0.1    # b0-Loss wird auf 10% skaliert
 WEIGHT_DWI = 1.0   # DWI-Loss behält 100% Gewicht
 
 MAIN_PATH = "/mnt/nas_io/anarchy/lohrd/MRI_data/HCP/Diffusion/3T/"  # UKE: "/home/wquan/Schreibtisch/Data/Diffusion/3T/"  # HO: "/mnt/nas_io/anarchy/lohrd/MRI_data/HCP/Diffusion/3T/"
-TRAIN_SUBJECTS = sorted(os.listdir(MAIN_PATH))[:NUM_TRAIN_PROBANDS]
-VAL_SUBJECTS = sorted(os.listdir(MAIN_PATH))[NUM_TRAIN_PROBANDS:NUM_TRAIN_PROBANDS+NUM_VAL_PROBANDS]
 
+with open("train_subjects.csv", newline="") as f:
+    TRAIN_SUBJECTS = [subject.strip() for subject in f]
+
+with open("val_subjects.csv", newline="") as f:
+    VAL_SUBJECTS = [subject.strip() for subject in f]
 
 # --- TRAININGS-PFADE ---
 TRAIN_NIFTI_FILES = [ os.path.join(MAIN_PATH, subj, "T1w", "Diffusion/data.nii.gz") for subj in TRAIN_SUBJECTS ]
