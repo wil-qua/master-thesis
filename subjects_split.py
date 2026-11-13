@@ -13,6 +13,60 @@ print("="*40)
 MAIN_PATH = "/mnt/nas_io/anarchy/lohrd/MRI_data/HCP/Diffusion/3T/"
 NUM_TRAIN_PROBANDS = 60
 NUM_VAL_PROBANDS = 12
+
+# Hilfsfunktion für zu kleine Altersgruppen (vermeidet Abstürze)
+def get_safe_stratify_labels(strat_series):
+    counts = strat_series.value_counts()
+    rare_classes = counts[counts < 2].index
+    if len(rare_classes) > 0:
+        majority_class = counts.idxmax()
+        return strat_series.replace(rare_classes, majority_class)
+    return strat_series
+
+# 1. Datensatz nach Geschlecht trennen
+df_f = df[df['Gender'] == 'F'].copy()
+df_m = df[df['Gender'] == 'M'].copy()
+
+# ==========================================
+# FRAUEN (36 insgesamt -> 30 Train, 6 Val)
+# ==========================================
+# 36 Frauen aus allen Frauen ziehen (stratified nach Alter)
+safe_age_f1 = get_safe_stratify_labels(df_f['Age'])
+f_train_val, _ = train_test_split(df_f, train_size=36, stratify=safe_age_f1, random_state=42)
+
+# Die 36 in 30 Train und 6 Val aufteilen
+safe_age_f2 = get_safe_stratify_labels(f_train_val['Age'])
+f_train, f_val = train_test_split(f_train_val, train_size=30, stratify=safe_age_f2, random_state=42)
+
+# ==========================================
+# MÄNNER (36 insgesamt -> 30 Train, 6 Val)
+# ==========================================
+# 36 Männer aus allen Männern ziehen (stratified nach Alter)
+safe_age_m1 = get_safe_stratify_labels(df_m['Age'])
+m_train_val, _ = train_test_split(df_m, train_size=36, stratify=safe_age_m1, random_state=42)
+
+# Die 36 in 30 Train und 6 Val aufteilen
+safe_age_m2 = get_safe_stratify_labels(m_train_val['Age'])
+m_train, m_val = train_test_split(m_train_val, train_size=30, stratify=safe_age_m2, random_state=42)
+
+# ==========================================
+# 3. ZUSAMMENFÜHREN & MISCHEN
+# ==========================================
+# DataFrames zusammensetzen und durchmischen (sample frac=1 mischt die Zeilen durch)
+df_train = pd.concat([f_train, m_train]).sample(frac=1, random_state=42).reset_index(drop=True)
+df_val = pd.concat([f_val, m_val]).sample(frac=1, random_state=42).reset_index(drop=True)
+
+# Ausgabe der finalen Verteilung zur Kontrolle
+print("\n--- Prozentuale Verteilung Trainingsset (exakt 60) ---")
+print(df_train[['Gender', 'Age']].value_counts(normalize=True).sort_index() * 100)
+
+print("\n--- Prozentuale Verteilung Validierungsset (exakt 12) ---")
+print(df_val[['Gender', 'Age']].value_counts(normalize=True).sort_index() * 100)
+
+df_train['Subject'].to_csv('train_subjects.csv', index=False, header=False)
+df_val['Subject'].to_csv('val_subjects.csv', index=False, header=False)
+
+"""
 all_subjects_in_dir = sorted(os.listdir(MAIN_PATH))
 train_subjects = all_subjects_in_dir[:NUM_TRAIN_PROBANDS]
 val_subjects = all_subjects_in_dir[NUM_TRAIN_PROBANDS : NUM_TRAIN_PROBANDS + NUM_VAL_PROBANDS]
@@ -90,3 +144,4 @@ print("="*40)
 print("Geschlecht:\n", val_df['Gender'].value_counts())
 print("\nAlter:\n", val_df['Age'].value_counts())
 print("\nKreuztabelle (Alter x Geschlecht):\n", pd.crosstab(val_df['Age'], val_df['Gender']))
+"""
