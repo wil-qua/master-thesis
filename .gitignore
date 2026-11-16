@@ -27,7 +27,7 @@ Thumbs.db:encryptable
 *.joblib
 Figures/
 *.Identifier
-
+npy_cache/
 # Helper-files
 *.html
 *.bval
