@@ -10,13 +10,14 @@ PATCH_SIZE = 64
 DOWNSCALE_FACTOR = 2
 NUM_PATCHES_PER_EPOCH = 1000
 NUM_VAL_PATCHES = 100
-# NUM_EPOCHS = 300
+# NUM_EPOCHS = 300  # outdated, because of early stoppage if no improvement
 MAX_MEASUREMENTS = 35
 NUM_TRAIN_PROBANDS = 30
 NUM_VAL_PROBANDS = 6
 LOSS_FUNCTION = "Masked L1 + SSIM"
 WEIGHT_B0 = 0.1    # b0-Loss wird auf 10% skaliert
 WEIGHT_DWI = 1.0   # DWI-Loss behält 100% Gewicht
+LAMBDA_DC = 0.2  # Gewichtung für den Data Consistency Loss
 
 MAIN_PATH = "/mnt/nas_io/anarchy/lohrd/MRI_data/HCP/Diffusion/3T/"  # UKE: "/home/wquan/Schreibtisch/Data/Diffusion/3T/"  # HO: "/mnt/nas_io/anarchy/lohrd/MRI_data/HCP/Diffusion/3T/"
 

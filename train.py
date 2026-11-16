@@ -495,7 +495,7 @@ def main():
     best_val_loss = float('inf')
     
     degradation = DegradationLayer(sigma=0.8, downscale_factor=config.DOWNSCALE_FACTOR).to(device)
-    LAMBDA_DC = 0.5  # Gewichtung für den Data Consistency Loss
+    
 
     global_step = 0
     
@@ -537,7 +537,7 @@ def main():
             # Gewichtung der Loss-Komponenten
             "weight_b0": config.WEIGHT_B0,
             "weight_dwi": config.WEIGHT_DWI,
-            "lambda_dc": LAMBDA_DC,
+            "lambda_dc": config.LAMBDA_DC,
 
             # Degradation
             "degradation_sigma": 0.8,
@@ -549,13 +549,12 @@ def main():
 
     # Early Stopping
     PATIENCE = 15       # Anzahl Epochen ohne Verbesserung
-    MIN_DELTA = 0.001   # Mindestverbesserung der Validation-Loss
 
     epochs_without_improvement = 0
     best_val_loss = float("inf")
 
     TEST_RUN = False
-    TEST_EPOCHS = 2
+    TEST_EPOCHS = 50
     while True:
         epoch += 1
         model.train()
@@ -632,7 +631,7 @@ def main():
                     loss_dc = (diff * mask_brain_lr).sum() / (mask_brain_lr.sum() + 1e-8)
 
                     # Gesamt-Loss
-                    loss = loss_sr + LAMBDA_DC * loss_dc
+                    loss = (1 - config.LAMBDA_DC) * loss_sr + config.LAMBDA_DC * loss_dc
                 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -655,7 +654,7 @@ def main():
                 mask_brain_lr = hr_mask[:, :, ::config.DOWNSCALE_FACTOR, ::config.DOWNSCALE_FACTOR, ::config.DOWNSCALE_FACTOR]
                 loss_dc = (diff * mask_brain_lr).sum() / (mask_brain_lr.sum() + 1e-8)
                 
-                loss = loss_sr + LAMBDA_DC * loss_dc
+                loss = (1 - config.LAMBDA_DC) * loss_sr + config.LAMBDA_DC * loss_dc
                 
                 loss.backward()
                 optimizer.step()
@@ -772,25 +771,6 @@ def main():
         if TEST_RUN and epoch >= TEST_EPOCHS:
             print(f"\nTestlauf nach {TEST_EPOCHS} Epochen beendet.")
             break
-        # === Checkpoint und Plot alle 20 Epochen speichern ===
-        CHECKPOINT_FREQ = 20
-        if epoch % CHECKPOINT_FREQ == 0:
-            ckpt_path = f"Models/model_A_epoch_{epoch}.pth"
-            plot_path = f"Figures/training_loss_model_A_epoch_{epoch}.png"
-            
-            # Modell-Gewichte für diese spezifische Epoche sichern
-            torch.save(model.state_dict(), ckpt_path)
-            
-            # Trainingsverlauf bis hierhin plotten
-            plot_training_loss(
-                train_loss_history, 
-                val_loss_history=val_loss_history, 
-                config=config, 
-                save_path=plot_path
-            )
-            print(f"  [Checkpoint] Status gesichert: {ckpt_path} und {plot_path}\n")
-        else:
-            print()
 
     # === MODELL SPEICHERN UND PLOTTEN (mit beiden Kurven) ===
     plot_training_loss(
