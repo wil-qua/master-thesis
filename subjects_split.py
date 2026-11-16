@@ -3,16 +3,19 @@ from sklearn.model_selection import train_test_split
 import os
 
 # 1. Daten laden
+MAIN_PATH = "/mnt/nas_io/anarchy/lohrd/MRI_data/HCP/Diffusion/3T/"
 df = pd.read_csv('HCP_YA_subjects_2026_10.csv')
+
+data_subjects = [int(proband) for proband in os.listdir(MAIN_PATH)]
+df = df[df['Subject'].isin(data_subjects)]
 
 print("Verteilung: Gesamter Datensatz")
 print(df['Gender'].value_counts())
 print(df['Age'].value_counts())
 print("="*40)
 
-MAIN_PATH = "/mnt/nas_io/anarchy/lohrd/MRI_data/HCP/Diffusion/3T/"
-NUM_TRAIN_PROBANDS = 60
-NUM_VAL_PROBANDS = 12
+NUM_TRAIN_PROBANDS = 25 # 15 25
+NUM_VAL_PROBANDS = 5 # 3 5
 
 # Hilfsfunktion für zu kleine Altersgruppen (vermeidet Abstürze)
 def get_safe_stratify_labels(strat_series):
@@ -32,22 +35,22 @@ df_m = df[df['Gender'] == 'M'].copy()
 # ==========================================
 # 36 Frauen aus allen Frauen ziehen (stratified nach Alter)
 safe_age_f1 = get_safe_stratify_labels(df_f['Age'])
-f_train_val, _ = train_test_split(df_f, train_size=36, stratify=safe_age_f1, random_state=42)
+f_train_val, _ = train_test_split(df_f, train_size=NUM_TRAIN_PROBANDS+NUM_VAL_PROBANDS, stratify=safe_age_f1, random_state=42)
 
 # Die 36 in 30 Train und 6 Val aufteilen
 safe_age_f2 = get_safe_stratify_labels(f_train_val['Age'])
-f_train, f_val = train_test_split(f_train_val, train_size=30, stratify=safe_age_f2, random_state=42)
+f_train, f_val = train_test_split(f_train_val, train_size=NUM_TRAIN_PROBANDS, stratify=safe_age_f2, random_state=42)
 
 # ==========================================
 # MÄNNER (36 insgesamt -> 30 Train, 6 Val)
 # ==========================================
 # 36 Männer aus allen Männern ziehen (stratified nach Alter)
 safe_age_m1 = get_safe_stratify_labels(df_m['Age'])
-m_train_val, _ = train_test_split(df_m, train_size=36, stratify=safe_age_m1, random_state=42)
+m_train_val, _ = train_test_split(df_m, train_size=NUM_TRAIN_PROBANDS+NUM_VAL_PROBANDS, stratify=safe_age_m1, random_state=42)
 
 # Die 36 in 30 Train und 6 Val aufteilen
 safe_age_m2 = get_safe_stratify_labels(m_train_val['Age'])
-m_train, m_val = train_test_split(m_train_val, train_size=30, stratify=safe_age_m2, random_state=42)
+m_train, m_val = train_test_split(m_train_val, train_size=NUM_TRAIN_PROBANDS, stratify=safe_age_m2, random_state=42)
 
 # ==========================================
 # 3. ZUSAMMENFÜHREN & MISCHEN
@@ -57,10 +60,10 @@ df_train = pd.concat([f_train, m_train]).sample(frac=1, random_state=42).reset_i
 df_val = pd.concat([f_val, m_val]).sample(frac=1, random_state=42).reset_index(drop=True)
 
 # Ausgabe der finalen Verteilung zur Kontrolle
-print("\n--- Prozentuale Verteilung Trainingsset (exakt 60) ---")
+print("\n--- Prozentuale Verteilung Trainingsset (60) ---")
 print(df_train[['Gender', 'Age']].value_counts(normalize=True).sort_index() * 100)
 
-print("\n--- Prozentuale Verteilung Validierungsset (exakt 12) ---")
+print("\n--- Prozentuale Verteilung Validierungsset (12) ---")
 print(df_val[['Gender', 'Age']].value_counts(normalize=True).sort_index() * 100)
 
 df_train['Subject'].to_csv('train_subjects.csv', index=False, header=False)
