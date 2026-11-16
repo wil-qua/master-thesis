@@ -8,12 +8,15 @@ sowie Extraktion von High-Resolution (HR) und Low-Resolution (LR) Patches.
 import numpy as np
 import nibabel as nib
 import torch
+import os
+import re
 from torch.utils.data import Dataset
 from scipy.ndimage import gaussian_filter
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-from scipy.ndimage import gaussian_filter, affine_transform
+import gc
+from scipy.ndimage import gaussian_filter, distance_transform_edt
 from scipy.spatial.transform import Rotation as R
 
 
@@ -300,6 +303,87 @@ class FlexibleDiffusionSampler:
             'target_bvecs': np.array(target_bvecs, dtype=np.float32)
         }
 
+def build_6_zone_sampling_pools(b0_4d, dwi_4d, brain_mask, patch_size=64, return_masks=False):
+    """
+    Teilt alle gültigen Patch-Zentren innerhalb der Gehirnmaske rein datengetrieben
+    (über Geometrie, DWI-Dämpfung und Winkel-Varianz) in 6 anatomisch/physikalisch
+    wichtige Zonen ein.
+    """
+    half_p = patch_size // 2
+    mask_bool = brain_mask > 0
+
+    valid_bbox = np.zeros_like(mask_bool, dtype=bool)
+    valid_bbox[half_p:-half_p, half_p:-half_p, half_p:-half_p] = True
+    eligible = mask_bool & valid_bbox
+    if not np.any(eligible):
+        eligible = mask_bool
+
+    # 1. Sparsame Kennwerte (float32, nur Teilmenge der Richtungen für std -> spart massiv RAM)
+    b0_mean = np.mean(b0_4d, axis=-1, dtype=np.float32) if b0_4d.ndim == 4 else b0_4d.astype(np.float32)
+    b0_safe = np.maximum(b0_mean, 1e-4)
+
+    attenuation = np.mean(dwi_4d, axis=-1, dtype=np.float32) / b0_safe
+    # n_sub = min(40, dwi_4d.shape[-1])
+    # angular_var = np.std(dwi_4d[..., :n_sub], axis=-1, dtype=np.float32) / b0_safe
+    angular_var = np.std(dwi_4d, axis=-1, dtype=np.float32) / b0_safe
+    del b0_mean, b0_safe
+
+    # 2. Geometrie ohne riesiges np.indices-Array
+    dist_to_edge = distance_transform_edt(mask_bool).astype(np.float32)
+    z_1d = np.arange(mask_bool.shape[2], dtype=np.int16)[None, None, :]
+    z_25 = np.percentile(np.where(mask_bool)[2], 25)
+
+    # Schwellenwerte innerhalb der gültigen Gehirnvoxel bestimmen
+    att_wm_thresh = np.percentile(attenuation[eligible], 55)     # Obere 45% = Weiße Substanz (WM)
+    att_csf_thresh = np.percentile(attenuation[eligible], 18)    # Untere 18% = CSF / Ventrikelgrenze
+    # Innerhalb der weißen Substanz: Top 35% Winkel-Varianz = Single-Fiber, Rest = Crossing-Fibers
+    wm_voxels = eligible & (attenuation >= att_wm_thresh)
+    ang_single_thresh = np.percentile(angular_var[wm_voxels], 65)
+    del wm_voxels
+
+    # --- Einteilung in 6 disjunkte Zonen ---
+    # Zone 3: Äußerer Kortex-Rand & U-Fibers (oberhalb Kleinhirn, nah an Oberfläche)
+    z3_cortical = eligible & (dist_to_edge <= 12) & (z_1d >= z_25)
+
+    # Zone 5: Hirnstamm & Kleinhirn (unterstes Z-Viertel, nicht reines CSF)
+    z5_brainstem_cereb = eligible & (~z3_cortical) & (z_1d < z_25) & (attenuation >= att_csf_thresh)
+
+    # Verbleibendes tiefes Großhirn
+    deep_cerebrum = eligible & (~z3_cortical) & (~z5_brainstem_cereb)
+
+    # Zone 6: Ventrikel & CSF-Grenzflächen (starker Signalabfall im DWI)
+    z6_csf = deep_cerebrum & (attenuation < att_csf_thresh)
+
+    # Zone 1: Single-Fiber High-FA (Corpus Callosum, Capsula Interna)
+    z1_single_fiber = deep_cerebrum & (attenuation >= att_wm_thresh) & (angular_var >= ang_single_thresh)
+
+    # Zone 2: Crossing-Fibers (Centrum Semiovale, Corona Radiata)
+    z2_crossing_fiber = deep_cerebrum & (attenuation >= att_wm_thresh) & (angular_var < ang_single_thresh)
+
+    # Zone 4: Subkortikale Kerne / Deep Gray Matter (Thalamus, Putamen, Pallidum)
+    z4_subcortical = deep_cerebrum & (attenuation >= att_csf_thresh) & (attenuation < att_wm_thresh)
+
+    del dist_to_edge, attenuation, angular_var, deep_cerebrum
+
+    zone_masks = {
+        "single_fiber_wm": z1_single_fiber,
+        "crossing_fiber_wm": z2_crossing_fiber,
+        "cortical_boundary": z3_cortical,
+        "subcortical_gm": z4_subcortical,
+        "brainstem_cerebellum": z5_brainstem_cereb,
+        "csf_boundary": z6_csf,
+    }
+    
+    # Koordinaten als platzsparendes int16 speichern!
+    fallback_coords = np.argwhere(eligible).astype(np.int16)
+    zone_pools = {}
+    for name, z_mask in zone_masks.items():
+        coords = np.argwhere(z_mask).astype(np.int16)
+        zone_pools[name] = coords if len(coords) > 0 else fallback_coords
+
+    gc.collect()
+    return (zone_pools, zone_masks) if return_masks else (zone_pools, None)
+
 def calculate_normalization_scalar(b0_volumes, brain_mask):
     """
     Berechnet den Skalierungsfaktor für die Normalisierung basierend auf dem
@@ -313,49 +397,82 @@ def calculate_normalization_scalar(b0_volumes, brain_mask):
     scalar = np.percentile(valid_voxels, 95)
     return float(scalar)
 
-def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_threshold, min_b_val, max_b_val):
-    """
-    Lädt eine Liste von Probanden (NIfTIs, bvals, bvecs, Masken) in den RAM-Cache 
-    und normalisiert jeden Probanden individuell anhand seines b0-95. Perzentils.
-    """
+def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_threshold, min_b_val, max_b_val, patch_size=64, cache_dir="npy_cache"):
+    os.makedirs(cache_dir, exist_ok=True)
     subjects_cache = []
     
     for i, (n_path, bval_p, bvec_p, m_path) in enumerate(zip(nifti_paths, bval_paths, bvec_paths, mask_paths)):
-        print(f"Lade Proband {i+1}/{len(nifti_paths)}: {n_path} ...")
+        # Eindeutigen Namen aus dem Probanden-Ordner ableiten (z.B. 146937)
+        match = re.search(r'/(\d{6})/', n_path)
+        subj_id = match.group(1) if match else f"subj_{i}"
+
+        b0_cache_file = os.path.join(cache_dir, f"{subj_id}_b0.npy")
+        dwi_cache_file = os.path.join(cache_dir, f"{subj_id}_dwi.npy")
+        pools_cache_file = os.path.join(cache_dir, f"{subj_id}_pools.npz")
+
+        print(f"Lade Proband {i+1}/{len(nifti_paths)} ({subj_id}) ...")
         bvals = np.loadtxt(bval_p).flatten()
         bvecs = np.loadtxt(bvec_p).T
         if bvecs.shape[0] == 3 and bvecs.shape[1] != 3:
             bvecs = bvecs.T
         
         sampler = FlexibleDiffusionSampler(bvals, bvecs, b0_threshold, min_b_val, max_b_val)
-        
-        mask_img = nib.load(m_path)
-        brain_mask = np.asanyarray(mask_img.dataobj)
-        
-        img = nib.load(n_path)
-        full_data_4d = np.asanyarray(img.dataobj, dtype=np.float32)
-        
-        b0_4d_array = full_data_4d[..., sampler.global_b0_indices]
-        dwi_4d_array = full_data_4d[..., sampler.global_dwi_indices]
-        
-        scalar = calculate_normalization_scalar(b0_4d_array, brain_mask)
-        
+        brain_mask = np.asanyarray(nib.load(m_path).dataobj).astype(np.uint8)
+
+        # Nur beim allerersten Mal aus NIfTI entpacken, normalisieren und auf Disk cachen
+        if not (os.path.exists(b0_cache_file) and os.path.exists(dwi_cache_file) and os.path.exists(pools_cache_file)):
+            print(f"  -> Erstelle einmaligen Memmap-Cache für {subj_id} ...")
+            img = nib.load(n_path)
+            full_data_4d = np.asanyarray(img.dataobj, dtype=np.float32)
+            
+            b0_4d_array = full_data_4d[..., sampler.global_b0_indices]
+            dwi_4d_array = full_data_4d[..., sampler.global_dwi_indices]
+            del full_data_4d
+            gc.collect()
+            
+            scalar = calculate_normalization_scalar(b0_4d_array, brain_mask)
+            b0_norm = (b0_4d_array / scalar).astype(np.float32)
+            dwi_norm = (dwi_4d_array / scalar).astype(np.float32)
+            del b0_4d_array, dwi_4d_array
+            gc.collect()
+
+            zone_pools, _ = build_6_zone_sampling_pools(b0_norm, dwi_norm, brain_mask, patch_size=patch_size)
+            
+            np.save(b0_cache_file, b0_norm)
+            np.save(dwi_cache_file, dwi_norm)
+            np.savez(pools_cache_file, **zone_pools)
+            del b0_norm, dwi_norm, zone_pools
+            gc.collect()
+
+        # RAM-sparend per Memory-Mapping einbinden (~0 MB RAM-Verbrauch!)
+        b0_mmap = np.load(b0_cache_file, mmap_mode='r')
+        dwi_mmap = np.load(dwi_cache_file, mmap_mode='r')
+        with np.load(pools_cache_file) as data:
+            zone_pools = {k: data[k] for k in data.files}
+
         subjects_cache.append({
-            'b0': b0_4d_array / scalar,
-            'dwi': dwi_4d_array / scalar,
+            'b0': b0_mmap,
+            'dwi': dwi_mmap,
             'mask': brain_mask,
-            'sampler': sampler
+            'sampler': sampler,
+            'zone_pools': zone_pools
         })
         
-    print(f"Alle {len(subjects_cache)} Probanden erfolgreich geladen und gecached.")
+    print(f"Alle {len(subjects_cache)} Probanden via Memory-Mapping eingebunden.")
     return subjects_cache
 
-def extract_random_patch(hr_data_b0, hr_data_dwi, mask, b0_indices, input_indices, target_vols_info, patch_size=64, fixed_center=None, min_brain_fraction=0.8):
+def extract_random_patch(
+    hr_data_b0, hr_data_dwi, mask, b0_indices, input_indices, target_vols_info,
+    patch_size=64, fixed_center=None, zone_pools=None, zone_name=None, rng=None
+):
     """
-    Sucht eine gültige Zentrumskoordinate innerhalb der Gehirnmaske und 
-    extrahiert einen 3D-Block (Patch), der mindestens zu `min_brain_fraction` 
-    mit Gehirnvoxeln gefüllt ist.
+    Zieht ein Patch-Zentrum stratifiziert aus einer der 6 anatomischen Zonen.
+    Passt min_brain_fraction automatisch an, damit Rand-Patches (Kortex/Kleinhirn)
+    nicht fälschlicherweise verworfen werden.
     """
+    if rng is None:
+        rng = np.random
+
     x_dim, y_dim, z_dim, _ = hr_data_dwi.shape
     half_patch = patch_size // 2
 
@@ -367,35 +484,40 @@ def extract_random_patch(hr_data_b0, hr_data_dwi, mask, b0_indices, input_indice
             cz - half_patch : cz + half_patch
         ]
     else:
-        valid_coords = np.where(mask > 0)
-        num_valid = len(valid_coords[0])
+        # 1. Zone auswählen (falls nicht fest vorgegeben, gleichverteilt 1 aus 6 wählen)
+        if zone_pools is not None:
+            if zone_name is None:
+                zone_names = list(zone_pools.keys())
+                zone_name = zone_names[int(rng.randint(0, len(zone_names)))]
+            coords_pool = zone_pools[zone_name]
+        else:
+            coords_pool = np.argwhere(mask > 0)
 
-        while True:
-            idx = np.random.randint(0, num_valid)
-            cx = valid_coords[0][idx]
-            cy = valid_coords[1][idx]
-            cz = valid_coords[2][idx]
+        # Am Kortex-Rand und Kleinhirn ragt ein 64^3-Würfel natürlich in den Hintergrund -> 0.40 erlauben
+        if zone_name in ("cortical_boundary", "brainstem_cerebellum"):
+            min_brain_fraction = 0.40
+        else:
+            min_brain_fraction = 0.75
 
-            # 1. Prüfen, ob der Patch komplett im Bildvolumen liegt
-            if (cx - half_patch >= 0 and cx + half_patch <= x_dim and
-                cy - half_patch >= 0 and cy + half_patch <= y_dim and
-                cz - half_patch >= 0 and cz + half_patch <= z_dim):
-                
-                # 2. Masken-Patch ausschneiden und Füllgrad prüfen
-                hr_mask = mask[
-                    cx - half_patch : cx + half_patch, 
-                    cy - half_patch : cy + half_patch, 
-                    cz - half_patch : cz + half_patch
-                ]
-                # sampling balancing, untersch. hirnregionen untersch. gewichtet, mitte wird höher gewichtet!! vllt sampling (ziehen aus rändern)
-                # anpassen
-                # bewusstsein dafür haben
-                # vergleiche fehler in versch. bereichen
-                # Nur akzeptieren, wenn mindestens X% (z.B. 80%) im Gehirn liegen
-                if np.mean(hr_mask > 0) >= min_brain_fraction:  # BOOKMARK: schaue, wie viel leere pixel insg in FOV drin sind
-                    break  # wie viele CSF (Flüssigkeit), schwarz in dMRI, gewebe vs wasser
+        for attempt in range(50):
+            idx = int(rng.randint(0, len(coords_pool)))
+            cx, cy, cz = coords_pool[idx]
 
-    # Patches aus b0 und DWI herausschneiden (erst wenn gültiges Zentrum gefunden wurde)
+            # Sicherstellen, dass der Patch komplett im Bildvolumen liegt
+            cx = int(np.clip(cx, half_patch, x_dim - half_patch))
+            cy = int(np.clip(cy, half_patch, y_dim - half_patch))
+            cz = int(np.clip(cz, half_patch, z_dim - half_patch))
+
+            hr_mask = mask[
+                cx - half_patch : cx + half_patch, 
+                cy - half_patch : cy + half_patch, 
+                cz - half_patch : cz + half_patch
+            ]
+            # Nach 50 Fehlversuchen akzeptieren wir den Patch trotzdem, um Endlosschleifen zu vermeiden
+            if np.mean(hr_mask > 0) >= min_brain_fraction or attempt == 49:
+                break
+
+    # Patches aus b0 und DWI herausschneiden
     hr_patch_b0 = hr_data_b0[
         cx - half_patch : cx + half_patch, 
         cy - half_patch : cy + half_patch, 
@@ -557,36 +679,45 @@ class HCPPatchDataset(Dataset):
 
     def _freeze_validation_combinations(self):
         """
-        Für jeden Validierungs-Patch werden Proband, Patch-Koordinaten und gezogene DWI-/b0-Bilder einmalig
-        bei der Dataset-Initialisierung festgelegt und bleiben über alle Epochen gleich.
+        Legt für die Validierung feste Patches an, die exakt gleichmäßig (reihum i % 6)
+        alle 6 Hirnzonen und die verschiedenen DWI-Input-Anzahlen abdecken.
         """
         rng = np.random.RandomState(42)
         half_patch = self.patch_size // 2
-        protocol_dwi_counts = [6, 12, 18, 24, 30]  # legt fest, mit wie vielen DWI-input-directions die Validierungs-Patches getestet werden sollen.
-        # BOOKMARK: Macht fixe DWI-Anzahl in Validation Sinn, oder soll es da auch flexibel gehalten werden?
+        protocol_dwi_counts = [6, 12, 18, 24, 30]
+        zone_names = [
+            "single_fiber_wm",
+            "crossing_fiber_wm",
+            "cortical_boundary",
+            "subcortical_gm",
+            "brainstem_cerebellum",
+            "csf_boundary"
+        ]
 
         self.frozen_val_specs = []
         
         for i in range(self.num_patches):
-            # Zufällig einen der Validation-Probanden wählen
             subj_idx = rng.randint(0, len(self.subjects_cache))
             subj = self.subjects_cache[subj_idx]
-            
             x_dim, y_dim, z_dim, _ = subj['dwi'].shape
-            valid_coords = np.where(subj['mask'] > 0)
-            num_valid = len(valid_coords[0])
-            
-            while True:
-                c_idx = rng.randint(0, num_valid)
-                cx, cy, cz = valid_coords[0][c_idx], valid_coords[1][c_idx], valid_coords[2][c_idx]
-                if (cx - half_patch >= 0 and cx + half_patch <= x_dim and
-                    cy - half_patch >= 0 and cy + half_patch <= y_dim and
-                    cz - half_patch >= 0 and cz + half_patch <= z_dim):
+
+            # Reihum eine der 6 Zonen wählen!
+            zone_name = zone_names[i % len(zone_names)]
+            coords_pool = subj['zone_pools'][zone_name]
+            min_frac = 0.40 if zone_name in ("cortical_boundary", "brainstem_cerebellum") else 0.75
+
+            for attempt in range(50):
+                c_idx = int(rng.randint(0, len(coords_pool)))
+                cx, cy, cz = coords_pool[c_idx]
+                cx = int(np.clip(cx, half_patch, x_dim - half_patch))
+                cy = int(np.clip(cy, half_patch, y_dim - half_patch))
+                cz = int(np.clip(cz, half_patch, z_dim - half_patch))
+
+                hr_m = subj['mask'][cx-half_patch:cx+half_patch, cy-half_patch:cy+half_patch, cz-half_patch:cz+half_patch]
+                if np.mean(hr_m > 0) >= min_frac or attempt == 49:
                     break
             
             n_dwi = protocol_dwi_counts[i % len(protocol_dwi_counts)]
-            n_b0 = max(1, n_dwi // 6)
-            
             sample_dict = subj['sampler'].sample(
                 num_targets=self.num_targets,
                 plot=False,
@@ -597,6 +728,7 @@ class HCPPatchDataset(Dataset):
             self.frozen_val_specs.append({
                 'subj_idx': subj_idx,
                 'center': (cx, cy, cz),
+                'zone_name': zone_name,
                 'sample': sample_dict
             })
 
@@ -613,7 +745,14 @@ class HCPPatchDataset(Dataset):
         else:
             subj_idx = np.random.choice(len(self.subjects_cache))
             subj = self.subjects_cache[subj_idx]
-            s = subj['sampler'].sample(num_targets=self.num_targets, plot=False)
+            protocol_dwi_counts = [6, 12, 18, 24, 30]
+            n_dwi = int(np.random.choice(protocol_dwi_counts))
+
+            s = subj['sampler'].sample(
+                num_targets=self.num_targets,
+                plot=False,
+                n_dwi=n_dwi
+            )
             fixed_center = None
             apply_rotation = False  # Augmentation Switch (verlustfreie 90°-Rotationen, erstmal ausgeschaltet, weil 90° Rotationen in der Praxis nicht vorkommen)
         
@@ -621,7 +760,7 @@ class HCPPatchDataset(Dataset):
         hr_patch_b0, hr_patch_dwi, hr_target, hr_mask = extract_random_patch(
             subj['b0'], subj['dwi'], subj['mask'], 
             s['b0_indices'], s['input_indices'], s['target_vols_info'], 
-            self.patch_size, fixed_center=fixed_center
+            self.patch_size, fixed_center=fixed_center, zone_pools=subj.get('zone_pools')
         )
         
         # 2. Eine einzige 90°-Rotation (aus den 24 Würfel-Symmetrien) ziehen
