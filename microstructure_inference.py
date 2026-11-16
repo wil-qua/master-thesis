@@ -31,11 +31,33 @@ from dataset import (
 )
 from train import ModelA_FlexibleSR
 from sh_reference import RegularizedSHBaseline
+from dataset import build_6_zone_sampling_pools
+
 
 n_input_dwi = 30
 # ===========================================================
 # 1. INFERENCE HILFSFUNKTIONEN (Sliding Window Stitching)
 # ===========================================================
+
+@torch.no_grad()
+
+def create_3d_sinusoidal_weight(patch_size, min_weight=1e-3):
+    """
+    Erzeugt ein 3D-Sinus-Fenster (sin^2 / Hann-Window) der Shape [P, P, P].
+    Im Zentrum des Patches ist das Gewicht 1.0, zu den Rändern fällt es sanft 
+    sinusförmig auf min_weight ab. Bei 50% Overlap ergänzen sich benachbarte 
+    Patches perfekt zu einer konstanten Summe (sin^2 + cos^2 = 1).
+    """
+    # 1D-Kurve von 0 bis pi: sin(x)^2 steigt sanft von 0 auf 1 (Mitte) und fällt wieder auf 0
+    coords = np.linspace(0, np.pi, patch_size, dtype=np.float32)
+    w_1d = np.sin(coords) ** 2
+    
+    # Auf min_weight clippen, damit am äußersten Rand des Gesamtvolumens nie durch 0 geteilt wird
+    w_1d = np.clip(w_1d, a_min=min_weight, a_max=1.0)
+    
+    # 3D-Tensor-Produkt aus den drei 1D-Sinuskurven bilden: Shape [P, P, P]
+    w_3d = w_1d[:, None, None] * w_1d[None, :, None] * w_1d[None, None, :]
+    return w_3d.astype(np.float32)
 
 @torch.no_grad()
 def predict_volume_unet(
@@ -91,6 +113,8 @@ def predict_volume_unet(
         zs.append(Z_lr - lr_patch_size)
 
     hr_predictions = np.zeros((X_hr, Y_hr, Z_hr, n_targets), dtype=np.float32)
+    # 3D-Sinus-Gewichtungsfenster einmalig für die HR-Patch-Größe berechnen
+    patch_weight = create_3d_sinusoidal_weight(hr_patch_size, min_weight=1e-3)
 
     # Für die EINE aktuelle Zielrichtung t_idx: ganzes Gehirn Patch für Patch abfahren.
     # Pro Position (x, y, z): 30 Input-Richtungen dieses Ausschnitts -> 1 HR-Patch dieser Richtung.
@@ -129,10 +153,11 @@ def predict_volume_unet(
                     pred_np = pred_patch.squeeze().cpu().numpy()  # [hr_patch, hr_patch, hr_patch]
 
                     hx, hy, hz = x * downscale_factor, y * downscale_factor, z * downscale_factor
-                    vol_sum[hx:hx+hr_patch_size, hy:hy+hr_patch_size, hz:hz+hr_patch_size] += pred_np
-                    vol_weight[hx:hx+hr_patch_size, hy:hy+hr_patch_size, hz:hz+hr_patch_size] += 1.0
+                    vol_sum[hx:hx+hr_patch_size, hy:hy+hr_patch_size, hz:hz+hr_patch_size] += pred_np * patch_weight
+                    vol_weight[hx:hx+hr_patch_size, hy:hy+hr_patch_size, hz:hz+hr_patch_size] += patch_weight
 
-        hr_predictions[..., t_idx] = vol_sum / np.maximum(vol_weight, 1.0)
+        # Normierung teilt durch die aufsummierten Sinus-Gewichte pro Voxel
+        hr_predictions[..., t_idx] = vol_sum / np.maximum(vol_weight, 1e-8)
         print(f"  U-Net Richtung [{t_idx+1}/{n_targets}] rekonstruiert.")
 
     return hr_predictions
@@ -342,7 +367,7 @@ def main():
     # 4. Rekonstruktion 1: U-Net (Model A)
     print("\nStarte U-Net Rekonstruktion...")
     model = ModelA_FlexibleSR(meta_dim=14).to(device)
-    model_path = "Models/model_A_best.pth"
+    model_path = "Models/model_A_best_20261105.pth"
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
         print(f"Gewichte geladen aus: {model_path}")
@@ -492,6 +517,22 @@ def main():
     print(f"Rauschboden MAE ≈ {0.8*sigma:.4f}")
     wm = hr_mask & (metrics_gt["FA"] > 0.4)
     print("Alle NIfTI-Karten (inkl. fODF) wurden im Ordner 'Results/' gespeichert.")
+
+    # --- Regionale Auswertung über die 6 Hirnzonen (Marker) ---
+    _, zone_masks = build_6_zone_sampling_pools(hr_b0_in, hr_dwi_gt, hr_mask, patch_size=config.PATCH_SIZE, return_masks=True)
+
+    # 3D-Label-Karte (Werte 1 bis 6) als NIfTI speichern zur Kontrolle im Viewer
+    zone_label_vol = np.zeros(hr_mask.shape, dtype=np.uint8)
+    print("\n================ ERGEBNISSE PRO HIRNREGION (fODF & FA MAE) ================")
+    for z_idx, (z_name, z_mask) in enumerate(zone_masks.items(), start=1):
+        zone_label_vol[z_mask] = z_idx
+        fodf_u = compute_masked_mae(fodf_unet, fodf_gt, z_mask)
+        fodf_s = compute_masked_mae(fodf_sh, fodf_gt, z_mask)
+        fa_u   = compute_masked_mae(metrics_unet["FA"], metrics_gt["FA"], z_mask)
+        fa_s   = compute_masked_mae(metrics_sh["FA"], metrics_gt["FA"], z_mask)
+        print(f"Zone {z_idx} ({z_name:20s}) | fODF MAE -> U-Net: {fodf_u:.5f} vs SH: {fodf_s:.5f} | FA MAE -> U-Net: {fa_u:.5f} vs SH: {fa_s:.5f}")
+
+    nib.save(nib.Nifti1Image(zone_label_vol, affine), "Results/Brain_6_Zones_Markers.nii.gz")
 
 if __name__ == "__main__":
     main()
