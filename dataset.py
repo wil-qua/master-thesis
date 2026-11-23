@@ -488,7 +488,7 @@ def extract_random_patch(
         if zone_pools is not None:
             if zone_name is None:
                 zone_names = list(zone_pools.keys())
-                zone_name = zone_names[int(rng.randint(0, len(zone_names)))]
+                zone_name = zone_names[int(rng.randint(0, len(zone_names)))]  # Zufälliges Ziehen der Zone im Training
             coords_pool = zone_pools[zone_name]
         else:
             coords_pool = np.argwhere(mask > 0)
