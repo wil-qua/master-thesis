@@ -90,6 +90,12 @@ class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard 
         self.enc3 = nn.Sequential(ResBlock3D(64), ResBlock3D(64))
         
         # --- Metadata Modulation (FiLM) ---
+        self.meta_mlp1 = MetadataMLP(meta_dim, 16)
+        self.mod_conv1 = nn.Conv3d(16, 16, kernel_size=1)
+
+        self.meta_mlp2 = MetadataMLP(meta_dim, 32)
+        self.mod_conv2 = nn.Conv3d(32, 32, kernel_size=1)
+
         self.mod_conv1x1 = nn.Conv3d(64, 64, kernel_size=1)
         self.meta_mlp = MetadataMLP(meta_dim, feature_channels=64)
         self.mod_silu = nn.SiLU()
@@ -147,8 +153,11 @@ class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard 
         """
         x_dwi:      [B, N_max=35, 1, D, H, W]
         x_b0:       [B, 1, 1, D, H, W]
-        meta_ij:    [B, N_max=35, 14] 
-        valid_mask: [B, N_max=35]
+        meta_ij:    [B, N_max=35, 14]  
+        valid_mask: [B, N_max=35].
+        meta_ij ist ein 14-dimensionaler Vektor pro Input-Bild,
+        der den b-Wert und die Gradientenrichtung ($gg^T$) der Eingabemessung i (Indizes 0–6)
+        sowie den b-Wert und die Gradientenrichtung der gesuchten Zielmessung j (Indizes 7–13) enthält.
         """
         B, N_max, _, D, H, W = x_dwi.shape
         B_b0, N_b0 = x_b0.shape[0], x_b0.shape[1]
@@ -171,11 +180,12 @@ class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard 
         e3 = self.enc3(self.down2(e2)) 
 
         # --- 3. Modulation (Der FiLM-Schritt) ---
+        # FiLM (Feature-wise Linear Modulation) passt die Feature-Maps eines CNNs kanalweise anhand von Zusatzinformationen (meta_ij) an
         meta_flat = meta_ij.view(B * N_max, -1) # [B*35, 14]
         gamma, beta = self.meta_mlp(meta_flat) 
         
         F_i_conv = self.mod_conv1x1(e3)
-        u_ij = self.mod_silu((1 + gamma) * F_i_conv + beta) 
+        u_ij = self.mod_silu((1 + gamma) * F_i_conv + beta)   # modulation 
         
         # Masked Averaging
         u_ij_reshaped = u_ij.view(B, N_max, 64, D//4, H//4, W//4)
@@ -185,8 +195,13 @@ class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard 
         u_fused = self.bottleneck_fuse(torch.cat([u_j_avg, b0_feat_3], dim=1))
         
         # Skip-Connections mit Masked Averaging mitteln
-        skip1 = self.masked_average(e1.view(B, N_max, 16, D, H, W), valid_mask_dwi)
-        skip2 = self.masked_average(e2.view(B, N_max, 32, D//2, H//2, W//2), valid_mask_dwi)
+        gamma1, beta1 = self.meta_mlp1(meta_flat)
+        u1_ij = self.mod_silu((1 + gamma1) * self.mod_conv1(e1) + beta1)
+        skip1 = self.masked_average(u1_ij.view(B, N_max, 16, D, H, W), valid_mask_dwi)
+
+        gamma2, beta2 = self.meta_mlp2(meta_flat)
+        u2_ij = self.mod_silu((1 + gamma2) * self.mod_conv2(e2) + beta2)
+        skip2 = self.masked_average(u2_ij.view(B, N_max, 32, D//2, H//2, W//2), valid_mask_dwi)
 
         # --- 4. Decoder & b0-Fusion ---
         d2 = self.upsample_trilinear(u_fused)
@@ -417,6 +432,73 @@ def validate(
     }
 
 
+def save_checkpoint(
+    path,
+    epoch,
+    global_step,
+    model,
+    optimizer,
+    scaler,
+    criterion,
+    best_val_loss,
+    epochs_without_improvement,
+    train_loss_history,
+    val_loss_history,
+):
+    checkpoint = {
+        "epoch": epoch,
+        "global_step": global_step,
+
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+
+        # AMP-Scaler kann bei CPU-Training None sein
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+
+        # Zustand der Loss-Funktion
+        "criterion_alpha": criterion.alpha,
+
+        # Early Stopping
+        "best_val_loss": best_val_loss,
+        "epochs_without_improvement": epochs_without_improvement,
+
+        # Verlauf für die Plots
+        "train_loss_history": train_loss_history,
+        "val_loss_history": val_loss_history,
+    }
+
+    # Erst temporär schreiben, dann atomar ersetzen
+    tmp_path = path + ".tmp"
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def traced_batches(loader):
+    iterator = iter(loader)
+    batch_idx = 0
+
+    while True:
+        print(
+            f"[DATA] Fordere Batch {batch_idx} an...",
+            flush=True
+        )
+
+        try:
+            batch = next(iterator)
+
+        except StopIteration:
+            break
+
+        print(
+            f"[DATA] Batch {batch_idx} erfolgreich geladen.",
+            flush=True
+        )
+
+        yield batch_idx, batch
+        batch_idx += 1
+
+
+
 # ==========================================
 # 3. TRAINING LOOP
 # ==========================================
@@ -488,11 +570,59 @@ def main():
     # scaler multipliziert kleine losses mit grißem Faktor, sodass auch kleine Gradienten in 16-bit Format passen
     scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
     
+
     # 4. TRAININGSSCHLEIFE
+
     epoch = 0
+    global_step = 0
+
     train_loss_history = []
     val_loss_history = []
-    best_val_loss = float('inf')
+
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
+
+    CHECKPOINT_PATH = "Models/latest_checkpoint.pth"
+    BEST_MODEL_PATH = "Models/model_A_best.pth"
+
+    # Vorhandenen Checkpoint laden
+    if os.path.exists(CHECKPOINT_PATH):
+
+        print(f"\nCheckpoint gefunden: {CHECKPOINT_PATH}")
+        print("Lade vorherigen Trainingszustand...")
+
+        checkpoint = torch.load(
+            CHECKPOINT_PATH,
+            map_location=device,
+            weights_only=False
+        )
+
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        if scaler is not None and checkpoint["scaler_state_dict"] is not None:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+        epoch = checkpoint["epoch"]
+        global_step = checkpoint["global_step"]
+
+        best_val_loss = checkpoint["best_val_loss"]
+        epochs_without_improvement = checkpoint["epochs_without_improvement"]
+
+        criterion.alpha = checkpoint["criterion_alpha"]
+
+        train_loss_history = checkpoint["train_loss_history"]
+        val_loss_history = checkpoint["val_loss_history"]
+
+        print(f"Fortsetzung ab Epoche {epoch + 1}")
+        print(f"Global Step: {global_step}")
+        print(f"Best Val Loss: {best_val_loss:.6f}")
+        print(f"Epochen ohne Verbesserung: {epochs_without_improvement}")
+        print(f"Loss alpha: {criterion.alpha}")
+
+    else:
+        print("\nKein Checkpoint vorhanden. Starte neues Training.")
+
     
     degradation = DegradationLayer(sigma=0.8, downscale_factor=config.DOWNSCALE_FACTOR).to(device)
     
@@ -550,9 +680,6 @@ def main():
     # Early Stopping
     PATIENCE = 15       # Anzahl Epochen ohne Verbesserung
 
-    epochs_without_improvement = 0
-    best_val_loss = float("inf")
-
     TEST_RUN = False
     TEST_EPOCHS = 50
     while True:
@@ -562,7 +689,7 @@ def main():
         epoch_dc_loss = 0.0
         epoch_total_loss = 0.0
         
-        for batch_idx, batch_data in enumerate(train_loader):
+        for batch_idx, batch_data in traced_batches(train_loader):
             global_step += 1
 
             if global_step == 500:
@@ -585,6 +712,25 @@ def main():
             if hr_mask.ndim == 4:
                 hr_mask = hr_mask.unsqueeze(1)
 
+            # GPU-Speicher vor dem Forward-Pass protokollieren
+            if device.type == "cuda":
+                allocated = torch.cuda.memory_allocated(device) / 1024**3
+                reserved = torch.cuda.memory_reserved(device) / 1024**3
+                free, total = torch.cuda.mem_get_info(device)
+
+                print(
+                    f"[GPU] Epoch {epoch} | Batch {batch_idx}/{len(train_loader)} | "
+                    f"Allocated: {allocated:.2f} GiB | "
+                    f"Reserved: {reserved:.2f} GiB | "
+                    f"Free: {free / 1024**3:.2f} GiB | "
+                    f"Total: {total / 1024**3:.2f} GiB"
+                )
+
+            print(
+                f"[SHAPES] DWI={tuple(x_dwi_padded.shape)} | "
+                f"b0={tuple(x_b0.shape)} | "
+                f"HR={tuple(hr_target.shape)}"
+            )
             optimizer.zero_grad()
             
             # --- Metadaten der INPUT-Richtungen für den DC-Term bauen ---
@@ -636,6 +782,8 @@ def main():
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
+                peak = torch.cuda.max_memory_allocated(device) / 1024**3
+                print(f"[GPU PEAK] Epoch {epoch} | Batch {batch_idx} | {peak:.2f} GiB")
             else:
                 # Dasselbe nochmal ohne AMP
                 sr_out = model(x_dwi_padded, x_b0, meta_padded, valid_mask_dwi, valid_mask_b0)
@@ -703,15 +851,6 @@ def main():
             b0_threshold=config.B0_THRESHOLD
         )
 
-        # Early Stopping
-        if criterion.alpha == 0.5 and epochs_without_improvement >= PATIENCE:
-            print(
-                f"\nEarly Stopping nach Epoche {epoch}: "
-                f"Validation-Loss hat sich seit {PATIENCE} Epochen "
-                f"nicht ausreichend verbessert."
-            )
-            break
-
         # Gewichteter Gesamt-SR-Loss
         avg_val_loss = val_metrics["sr_loss"]
 
@@ -723,13 +862,19 @@ def main():
         train_loss_history.append(avg_train_loss)
         val_loss_history.append(avg_val_loss)
         
-        # Bestes Modell abspeichern, wenn Val-Loss einen Rekord aufstellt
+
+        # Bestes Modell speichern und Early Stopping aktualisieren
         if avg_val_loss < best_val_loss:
+
             best_val_loss = avg_val_loss
             epochs_without_improvement = 0
-            torch.save(model.state_dict(), "Models/model_A_best.pth")
+
+            torch.save(model.state_dict(), BEST_MODEL_PATH)
+
             best_marker = " [* Best Val *]"
+
         else:
+
             epochs_without_improvement += 1
             best_marker = ""
 
@@ -759,17 +904,35 @@ def main():
             f"Val DWI: {avg_val_dwi_loss:.4f}"
             f"{best_marker}\n"
         )
-        # Bestes Modell abspeichern, wenn Val-Loss einen Rekord aufstellt
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "Models/model_A_best.pth")
-            best_marker = " [* Best Val *]"
-        else:
-            best_marker = ""
-            
-        print(f"==> Ende Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}{best_marker}")
+
+        # Vollständigen Trainingszustand sichern
+        save_checkpoint(
+            path=CHECKPOINT_PATH,
+            epoch=epoch,
+            global_step=global_step,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            criterion=criterion,
+            best_val_loss=best_val_loss,
+            epochs_without_improvement=epochs_without_improvement,
+            train_loss_history=train_loss_history,
+            val_loss_history=val_loss_history,
+        )
+
+        print(f"Checkpoint nach Epoche {epoch} gespeichert.")
+
         if TEST_RUN and epoch >= TEST_EPOCHS:
             print(f"\nTestlauf nach {TEST_EPOCHS} Epochen beendet.")
+            break
+
+        # Early Stopping
+        if criterion.alpha == 0.5 and epochs_without_improvement >= PATIENCE:
+            print(
+                f"\nEarly Stopping nach Epoche {epoch}: "
+                f"Validation-Loss hat sich seit {PATIENCE} Epochen "
+                f"nicht ausreichend verbessert."
+            )
             break
 
     # === MODELL SPEICHERN UND PLOTTEN (mit beiden Kurven) ===
