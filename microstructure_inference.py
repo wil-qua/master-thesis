@@ -369,8 +369,10 @@ def main():
 
     # 4. Rekonstruktion 1: U-Net (Model A)
     print("\nStarte U-Net Rekonstruktion...")
-    model = ModelA_FlexibleSR(meta_dim=14).to(device)
-    model_path = "Models/model_A_best.pth"
+    state_dict = torch.load(model_path, map_location=device)
+    use_skip_film = any(k.startswith("meta_mlp1") for k in state_dict.keys())
+    model = ModelA_FlexibleSR(meta_dim=14, use_skip_film=use_skip_film).to(device)
+    model_path = "Models/model_A_best_20261105.pth"
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
         print(f"Gewichte geladen aus: {model_path}")
