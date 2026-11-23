@@ -3,7 +3,7 @@ from sklearn.model_selection import train_test_split
 import os
 
 # 1. Daten laden
-MAIN_PATH = "/mnt/nas_io/anarchy/lohrd/MRI_data/HCP/Diffusion/3T/"
+MAIN_PATH = f"Z:\lohrd\MRI_data\HCP\Diffusion\\3T\\"  # "/mnt/nas_io/anarchy/lohrd/MRI_data/HCP/Diffusion/3T/"
 df = pd.read_csv('HCP_YA_subjects_2026_10.csv')
 
 data_subjects = [int(proband) for proband in os.listdir(MAIN_PATH)]
@@ -14,8 +14,8 @@ print(df['Gender'].value_counts())
 print(df['Age'].value_counts())
 print("="*40)
 
-NUM_TRAIN_PROBANDS = 25 # 15 25
-NUM_VAL_PROBANDS = 5 # 3 5
+NUM_TRAIN_PROBANDS = 50 # 15 25
+NUM_VAL_PROBANDS = 10 # 3 5
 
 # Hilfsfunktion für zu kleine Altersgruppen (vermeidet Abstürze)
 def get_safe_stratify_labels(strat_series):
