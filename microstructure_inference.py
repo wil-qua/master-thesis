@@ -169,8 +169,8 @@ def predict_volume_sh(lr_dwi, input_bvecs, target_bvecs, downscale_factor=2, lam
     lr_dwi: [X_lr, Y_lr, Z_lr, N_dwi]
     """
     n_dwi = lr_dwi.shape[-1]
-    # lmax = 4 if n_dwi >= 15 else 2
-    lmax = 2 # für konsistenten Vergleich zwischen versch. Anzahlen an inputs
+    lmax = 4 if n_dwi >= 15 else 2
+    # lmax = 2 # für konsistenten Vergleich zwischen versch. Anzahlen an inputs
 
     sh_model = RegularizedSHBaseline(lmax=lmax, lambda_reg=lambda_reg, spatial_scale=float(downscale_factor))
 
@@ -215,7 +215,8 @@ def compute_dipy_microstructure(dwi_hr, b0_hr, target_bvals, target_bvecs, b0_bv
         results["FA"] = dkifit.fa
         results["MD"] = dkifit.md
         results["MK"] = dkifit.mk(0, 3)
-        results["KFA"] = dkifit.kfa
+        results["KFA"] = dkifit.kfa  # Kurtosis Fractional Anisotropy
+        # higher-order metrics, QA
     else:
         print("  -> Single-Shell erkannt: Berechne DTI (FA, MD)...")
         tenmodel = dti.TensorModel(gtab)
@@ -235,6 +236,8 @@ def compute_fodf(dwi_volume, gtab, mask, response, sh_order=4):
     """
     # CSD-Modell mit der festen Referenz-Response initialisieren
     csd_model = ConstrainedSphericalDeconvModel(gtab, response, sh_order_max=sh_order)
+    # hier in read-me schauen
+    #dsi studio q-imaging vergleichen
     
     # Fit nur innerhalb der Gehirnmaske durchführen (spart enorm viel Rechenzeit)
     csd_fit = csd_model.fit(dwi_volume, mask=mask)
@@ -367,13 +370,15 @@ def main():
     # 4. Rekonstruktion 1: U-Net (Model A)
     print("\nStarte U-Net Rekonstruktion...")
     model = ModelA_FlexibleSR(meta_dim=14).to(device)
-    model_path = "Models/model_A_best_20261105.pth"
+    model_path = "Models/model_A_best.pth"
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
         print(f"Gewichte geladen aus: {model_path}")
     else:
         print(f"WARNUNG: {model_path} nicht gefunden! Nutze uninitialisiertes Modell.")
 
+
+    
     hr_dwi_unet = predict_volume_unet(
         model=model,
         lr_b0=lr_b0_in,
@@ -407,7 +412,7 @@ def main():
     hr_dwi_gt_phys = hr_dwi_gt * norm_scalar
     hr_dwi_unet_phys = hr_dwi_unet * norm_scalar
     hr_dwi_sh_phys = hr_dwi_sh * norm_scalar
-
+    
     # 7. DIPY Mikrostruktur (FA, MD, ggf. MK) für alle 3 Varianten berechnen
     print("\nBerechne DIPY Mikrostruktur für Ground Truth...")
     metrics_gt = compute_dipy_microstructure(
@@ -426,7 +431,7 @@ def main():
         hr_dwi_sh_phys, hr_b0_gt_phys, sample_spec["target_bvals"],
         sample_spec["target_bvecs"], sample_spec["b0_bvals"], hr_mask
     )
-
+    """
     # =========================================================================
     # fODF Berechnung mittels CSD (Crossing Fibers)
     # =========================================================================
@@ -468,7 +473,9 @@ def main():
     print("\n================ ERGEBNISSE (MAE im Gehirn) ================")
     print(f"Signal MAE (normiert) | U-Net: {compute_masked_mae(hr_dwi_unet, hr_dwi_gt, hr_mask):.5f} "
           f"| SH: {compute_masked_mae(hr_dwi_sh, hr_dwi_gt, hr_mask):.5f}")
+    """
 
+    """
     for m_name in metrics_gt.keys():
         mae_unet = compute_masked_mae(metrics_unet[m_name], metrics_gt[m_name], hr_mask)
         mae_sh = compute_masked_mae(metrics_sh[m_name], metrics_gt[m_name], hr_mask)
@@ -516,8 +523,12 @@ def main():
     sigma = np.std(hr_b0_in[hr_mask], axis=-1, ddof=1).mean()
     print(f"Rauschboden MAE ≈ {0.8*sigma:.4f}")
     wm = hr_mask & (metrics_gt["FA"] > 0.4)
+    print(f"Winkel-Varianz (Std über {max_available_targets} Richtungen) nur WM:")
+    print(f"  GT   : {np.std(hr_dwi_gt[wm], axis=-1).mean():.5f}")
+    print(f"  U-Net: {np.std(hr_dwi_unet[wm], axis=-1).mean():.5f}")
+    print(f"  SH   : {np.std(hr_dwi_sh[wm], axis=-1).mean():.5f}")
     print("Alle NIfTI-Karten (inkl. fODF) wurden im Ordner 'Results/' gespeichert.")
-
+    
     # --- Regionale Auswertung über die 6 Hirnzonen (Marker) ---
     _, zone_masks = build_6_zone_sampling_pools(hr_b0_in, hr_dwi_gt, hr_mask, patch_size=config.PATCH_SIZE, return_masks=True)
 
@@ -533,6 +544,64 @@ def main():
         print(f"Zone {z_idx} ({z_name:20s}) | fODF MAE -> U-Net: {fodf_u:.5f} vs SH: {fodf_s:.5f} | FA MAE -> U-Net: {fa_u:.5f} vs SH: {fa_s:.5f}")
 
     nib.save(nib.Nifti1Image(zone_label_vol, affine), "Results/Brain_6_Zones_Markers.nii.gz")
+    """
+
+    # =========================================================================
+    # 10. Kontroll-Vergleich: 30 vs. 60 vs. 90 Richtungen (FA gegen HR-GT 90)
+    # =========================================================================
+    print("\nBerechne FA-Kontrollvergleich (30 vs. 60 vs. 90 Richtungen)...")
+
+    # 1. HR-GT mit allen 90 Richtungen (30 Input + 60 Target)
+    hr_dwi_gt90_phys = np.concatenate([hr_dwi_in, hr_dwi_gt], axis=-1) * norm_scalar
+    bvals_90 = np.concatenate([sample_spec["input_bvals"], sample_spec["target_bvals"]])
+    bvecs_90 = np.vstack([sample_spec["input_bvecs"], sample_spec["target_bvecs"]])
+    fa_gt90 = compute_dipy_microstructure(
+        hr_dwi_gt90_phys, hr_b0_gt_phys, bvals_90, bvecs_90, sample_spec["b0_bvals"], hr_mask
+    )["FA"]
+
+    # 2. HR-GT mit nur den 30 Input-Richtungen
+    hr_dwi_gt30_phys = hr_dwi_in * norm_scalar
+    fa_gt30 = compute_dipy_microstructure(
+        hr_dwi_gt30_phys, hr_b0_gt_phys, sample_spec["input_bvals"],
+        sample_spec["input_bvecs"], sample_spec["b0_bvals"], hr_mask
+    )["FA"]
+
+    # 3. LR-Input (30 Richtungen), trilinear auf HR hochskaliert
+    lr_dwi_tensor = torch.from_numpy(np.transpose(lr_dwi_in, (3, 0, 1, 2))).unsqueeze(0).float()
+    hr_dwi_lr30_interp = F.interpolate(
+        lr_dwi_tensor, scale_factor=config.DOWNSCALE_FACTOR, mode="trilinear", align_corners=False
+    ).squeeze(0).numpy()
+    hr_dwi_lr30_interp_phys = np.transpose(hr_dwi_lr30_interp, (1, 2, 3, 0)) * norm_scalar
+    fa_lr30 = compute_dipy_microstructure(
+        hr_dwi_lr30_interp_phys, hr_b0_gt_phys, sample_spec["input_bvals"],
+        sample_spec["input_bvecs"], sample_spec["b0_bvals"], hr_mask
+    )["FA"]
+
+    # Metriken gegen HR-GT (90 Richtungen) ausgeben (Ganzhirn & WM)
+    wm_90 = hr_mask & (fa_gt90 > 0.2)
+    comparisons = [
+        ("HR-GT (30 Input-Dir)", fa_gt30),
+        ("HR-GT (60 Target-Dir)", metrics_gt["FA"]),
+        ("LR-Input (30 Dir, trilinear)", fa_lr30),
+        ("U-Net (60 Target-Dir)", metrics_unet["FA"]),
+        ("SH-Baseline (60 Target-Dir)", metrics_sh["FA"]),
+    ]
+
+    print("\n================ FA-VERGLEICH GEGEN HR-GT (90 RICHTUNGEN) ================")
+    for label, fa_map in comparisons:
+        diff_all = fa_map[hr_mask] - fa_gt90[hr_mask]
+        diff_wm = fa_map[wm_90] - fa_gt90[wm_90]
+        print(
+            f"{label:<30} | "
+            f"Brain MAE: {np.abs(diff_all).mean():.5f} (Bias: {diff_all.mean():+.5f}) | "
+            f"WM MAE: {np.abs(diff_wm).mean():.5f} (Bias: {diff_wm.mean():+.5f})"
+        )
+    print("==========================================================================")
+
+    # Zusätzliche FA-Karten als NIfTI speichern
+    nib.save(nib.Nifti1Image(fa_gt90.astype(np.float32), affine), "Results/FA_GT_90.nii.gz")
+    nib.save(nib.Nifti1Image(fa_gt30.astype(np.float32), affine), "Results/FA_GT_30.nii.gz")
+    nib.save(nib.Nifti1Image(fa_lr30.astype(np.float32), affine), "Results/FA_LR_30_trilinear.nii.gz")
 
 if __name__ == "__main__":
     main()
