@@ -76,9 +76,16 @@ class MetadataMLP(nn.Module):
 # ==========================================
 
 class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard ist, benutze auch vortrainierten encoder
-    def __init__(self, meta_dim=14):
+    def __init__(self, meta_dim=14, use_skip_film=True):
         super().__init__()
-        
+        self.use_skip_film = use_skip_film
+        if self.use_skip_film:
+            self.meta_mlp1 = MetadataMLP(meta_dim, 16)
+            self.mod_conv1 = nn.Conv3d(16, 16, kernel_size=1)
+
+            self.meta_mlp2 = MetadataMLP(meta_dim, 32)
+            self.mod_conv2 = nn.Conv3d(32, 32, kernel_size=1)
+
         # --- Encoder ---
         self.init_conv = nn.Conv3d(1, 16, kernel_size=3, padding=1)
         self.enc1 = nn.Sequential(ResBlock3D(16), ResBlock3D(16))
@@ -90,11 +97,6 @@ class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard 
         self.enc3 = nn.Sequential(ResBlock3D(64), ResBlock3D(64))
         
         # --- Metadata Modulation (FiLM) ---
-        self.meta_mlp1 = MetadataMLP(meta_dim, 16)
-        self.mod_conv1 = nn.Conv3d(16, 16, kernel_size=1)
-
-        self.meta_mlp2 = MetadataMLP(meta_dim, 32)
-        self.mod_conv2 = nn.Conv3d(32, 32, kernel_size=1)
 
         self.mod_conv1x1 = nn.Conv3d(64, 64, kernel_size=1)
         self.meta_mlp = MetadataMLP(meta_dim, feature_channels=64)
@@ -195,13 +197,16 @@ class ModelA_FlexibleSR(nn.Module): # schaue nach, was best practice / standard 
         u_fused = self.bottleneck_fuse(torch.cat([u_j_avg, b0_feat_3], dim=1))
         
         # Skip-Connections mit Masked Averaging mitteln
-        gamma1, beta1 = self.meta_mlp1(meta_flat)
-        u1_ij = self.mod_silu((1 + gamma1) * self.mod_conv1(e1) + beta1)
-        skip1 = self.masked_average(u1_ij.view(B, N_max, 16, D, H, W), valid_mask_dwi)
-
-        gamma2, beta2 = self.meta_mlp2(meta_flat)
-        u2_ij = self.mod_silu((1 + gamma2) * self.mod_conv2(e2) + beta2)
-        skip2 = self.masked_average(u2_ij.view(B, N_max, 32, D//2, H//2, W//2), valid_mask_dwi)
+        if self.use_skip_film:
+            gamma1, beta1 = self.meta_mlp1(meta_flat)
+            gamma2, beta2 = self.meta_mlp2(meta_flat)
+            u1_ij = self.mod_silu((1 + gamma1) * self.mod_conv1(e1) + beta1)
+            u2_ij = self.mod_silu((1 + gamma2) * self.mod_conv2(e2) + beta2)
+            skip1 = self.masked_average(u1_ij.view(B, N_max, 16, D, H, W), valid_mask_dwi)
+            skip2 = self.masked_average(u2_ij.view(B, N_max, 32, D//2, H//2, W//2), valid_mask_dwi)
+        else:
+            skip1 = self.masked_average(e1.view(B, N_max, 16, D, H, W), valid_mask_dwi)
+            skip2 = self.masked_average(e2.view(B, N_max, 32, D//2, H//2, W//2), valid_mask_dwi)
 
         # --- 4. Decoder & b0-Fusion ---
         d2 = self.upsample_trilinear(u_fused)
