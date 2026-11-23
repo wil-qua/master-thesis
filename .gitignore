@@ -28,6 +28,7 @@ Thumbs.db:encryptable
 Figures/
 *.Identifier
 npy_cache/
+
 # Helper-files
 *.html
 *.bval
@@ -37,3 +38,4 @@ test_script.py
 test.txt
 *.docx
 *.csv
+*.png
