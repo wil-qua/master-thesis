@@ -817,7 +817,7 @@ def main():
                         loss_sr += config.WEIGHT_DWI * loss_dwi
 
                     # 2. PASS: Vorhersage der 0-ten Input-DWI in HR (für DC)
-                    lr_to_hr = model(x_dwi_padded, x_b0, meta_input_self, valid_mask_dwi, valid_mask_b0)
+                    lr_to_hr = model(x_dwi_padded, x_b0, meta_input_self, valid_mask_dwi, valid_mask_b0)  # nimmt die 0-te LR-Eingaberichtung und rechnet sie auf HR hoch
                     pred_lr = degradation(lr_to_hr)
                     lr_target_0 = x_dwi_padded[:, 0]
                     
