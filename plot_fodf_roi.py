@@ -7,15 +7,17 @@ from dipy.core.sphere import Sphere
 from dipy.reconst.shm import sh_to_sf
 
 # --- 1. Pfade & Mittelpunkt im Centrum semiovale anpassen ---
-FA_GT     = "Results/FA_GT_old.nii.gz"
-FA_UNET   = "Results/FA_UNet_old.nii.gz"
-FA_SH     = "Results/FA_SH_old.nii.gz"
-FODF_GT   = "Results/fODF_GT_old.nii.gz"
-FODF_UNET = "Results/fODF_UNet_old.nii.gz"
-FODF_SH   = "Results/fODF_SH_old.nii.gz"
+suffix = "_old"
+
+FA_GT     = f"Results/FA_GT{suffix}.nii.gz"
+FA_UNET   = f"Results/FA_UNet{suffix}.nii.gz"
+FA_SH     = f"Results/FA_SH{suffix}.nii.gz"
+FODF_GT   = f"Results/fODF_GT{suffix}.nii.gz"
+FODF_UNET = f"Results/fODF_UNet{suffix}.nii.gz"
+FODF_SH   = f"Results/fODF_SH{suffix}.nii.gz"
 
 img = nib.load(FA_GT)
-X_MM, Y_MM, Z_MM = 20.0, -10.0, 29.0 # 20.0, -10.0, 29.0   # Zone 2 (Centrum Semiovale)
+X_MM, Y_MM, Z_MM = 20.0, -10.0, 29.0 # 19.0, -17.25, 27.5 # 20.0, -10.0, 29.0   # Zone 2 (Centrum Semiovale)
 # X_MM, Y_MM, Z_MM = 5, 10.25, 10.5       # Zone 6
 
 CX, CY, CZ = np.round(
@@ -173,6 +175,6 @@ for idx, (ax, title, sf, fa_bg) in enumerate(zip(axes, titles, sfs, fas)):
 cbar = fig.colorbar(im, cax=ax_cbar)
 cbar.set_label("Fractional Anisotropy (FA)", fontsize=11.5)
 
-out_path = "Results/fodf_comparison_zone2_old.png"
+out_path = f"Results/fodf_comparison_zone2{suffix}.png"
 plt.savefig(out_path, bbox_inches="tight", dpi=240)
 print(f"Gespeichert unter: {out_path}")
