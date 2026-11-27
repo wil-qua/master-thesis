@@ -16,6 +16,7 @@ from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import gc
+import mmap
 from scipy.ndimage import gaussian_filter, distance_transform_edt
 from scipy.spatial.transform import Rotation as R
 
@@ -427,7 +428,7 @@ def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_thre
             
             b0_4d_array = full_data_4d[..., sampler.global_b0_indices]
             dwi_4d_array = full_data_4d[..., sampler.global_dwi_indices]
-            del full_data_4d
+            del full_data_4d  # große temporäre Arrays werden explizit freigegeben
             gc.collect()
             
             scalar = calculate_normalization_scalar(b0_4d_array, brain_mask)
@@ -441,11 +442,10 @@ def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_thre
             np.save(b0_cache_file, b0_norm)
             np.save(dwi_cache_file, dwi_norm)
             np.savez(pools_cache_file, **zone_pools)
-            del b0_norm, dwi_norm, zone_pools
+            del b0_norm, dwi_norm, zone_pools 
             gc.collect()
 
-        # RAM-sparend per Memory-Mapping einbinden (~0 MB RAM-Verbrauch!)
-        b0_mmap = np.load(b0_cache_file, mmap_mode='r')
+        b0_mmap = np.load(b0_cache_file, mmap_mode='r')  # große numpy arrays bleiben auf SSD und werden nicht in RAM kopiert, sondern per Memory Mapping geladen
         dwi_mmap = np.load(dwi_cache_file, mmap_mode='r')
         with np.load(pools_cache_file) as data:
             zone_pools = {k: data[k] for k in data.files}
@@ -460,6 +460,51 @@ def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_thre
         
     print(f"Alle {len(subjects_cache)} Probanden via Memory-Mapping eingebunden.")
     return subjects_cache
+
+def release_subject_memmap_pages(subjects_cache):
+    """
+    Fordert Linux auf, nicht mehr benötigte Speicherseiten
+    der gemappten NPY-Dateien zurückzugewinnen.
+
+    Die Dateien bleiben geöffnet und die Daten unverändert.
+    Bei erneutem Zugriff werden benötigte Seiten wieder geladen.
+    """
+
+    if not hasattr(mmap, "MADV_PAGEOUT"):
+        print(
+            "[RAM] MADV_PAGEOUT wird von Python nicht unterstützt.",
+            flush=True
+        )
+        return
+
+    released = 0
+
+    for subj in subjects_cache:
+        for key in ("b0", "dwi"):
+            array = subj.get(key)
+
+            if array is None:
+                continue
+
+            mapping = getattr(array, "_mmap", None)
+
+            if mapping is None or mapping.closed:
+                continue
+
+            try:
+                mapping.madvise(mmap.MADV_PAGEOUT)
+                released += 1
+
+            except (OSError, ValueError) as e:
+                print(
+                    f"[RAM] Pageout für {key} fehlgeschlagen: {e}",
+                    flush=True
+                )
+
+    print(
+        f"[RAM] Pageout für {released} Memory-Mappings angefordert.",
+        flush=True
+    )
 
 def extract_random_patch(
     hr_data_b0, hr_data_dwi, mask, b0_indices, input_indices, target_vols_info,
