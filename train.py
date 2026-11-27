@@ -9,9 +9,51 @@ import wandb
 
 # Import der eigenen Module
 import config
-from dataset import load_multi_subjects, HCPPatchDataset
+from dataset import load_multi_subjects, HCPPatchDataset, release_subject_memmap_pages
 from utils import plot_training_loss
 
+def log_cgroup_memory(tag):
+    try:
+        with open("/proc/self/cgroup") as f:
+            cg_rel = next(
+                line.split(":", 2)[2].strip()
+                for line in f
+                if line.startswith("0::")
+            )
+
+        cg_path = os.path.join(
+            "/sys/fs/cgroup",
+            cg_rel.lstrip("/")
+        )
+
+        stats = {}
+
+        with open(os.path.join(cg_path, "memory.stat")) as f:
+            for line in f:
+                key, value = line.split()
+                stats[key] = int(value)
+
+        with open(os.path.join(cg_path, "memory.current")) as f:
+            current = int(f.read())
+
+        with open(os.path.join(cg_path, "memory.peak")) as f:
+            peak = int(f.read())
+
+        gib = 1024 ** 3
+
+        print(
+            f"[RAM] {tag} | "
+            f"Current: {current/gib:.2f} GiB | "
+            f"Peak: {peak/gib:.2f} GiB | "
+            f"Anon: {stats.get('anon', 0)/gib:.2f} GiB | "
+            f"File: {stats.get('file', 0)/gib:.2f} GiB | "
+            f"Inactive file: {stats.get('inactive_file', 0)/gib:.2f} GiB | "
+            f"Active file: {stats.get('active_file', 0)/gib:.2f} GiB",
+            flush=True
+        )
+
+    except Exception as e:
+        print(f"[RAM] Messung fehlgeschlagen: {e}", flush=True)
 # ==========================================
 # 1. BAUSTEINE FÜR MODEL A 
 # ==========================================
@@ -559,9 +601,9 @@ def main():
     )
     
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, 
-                              num_workers=0, pin_memory=True)
+                              num_workers=0, pin_memory=False)
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, 
-                            num_workers=0, pin_memory=True)
+                            num_workers=0, pin_memory=False)
     
     model = ModelA_FlexibleSR(meta_dim=14).to(device)
 
@@ -630,9 +672,11 @@ def main():
 
     
     degradation = DegradationLayer(sigma=0.8, downscale_factor=config.DOWNSCALE_FACTOR).to(device)
-    
 
-    global_step = 0
+    global_step = max(
+        global_step,
+        epoch * len(train_loader)
+    )
     
     # ==========================================
     # WEIGHTS & BIASES EXPERIMENT TRACKING
@@ -697,7 +741,7 @@ def main():
         for batch_idx, batch_data in traced_batches(train_loader):
             global_step += 1
 
-            if global_step == 500:
+            if global_step >= 500 and criterion.alpha < 0.5:
                 criterion.alpha = 0.5
                 print(f"\n[Update {global_step}] Loss-Funktion umgestellt auf 50% SSIM + 50% L1 (alpha=0.5)\n")
 
@@ -829,6 +873,9 @@ def main():
                     dwi_loss_val = 0.0
             
             if batch_idx % 10 == 0:
+                log_cgroup_memory(
+                    f"Epoch {epoch}, Batch {batch_idx}"
+                )
                 print(f"Epoch [{epoch}], Batch [{batch_idx}/{len(train_loader)}]")
                 print(f"  Gesamt SR-Loss: {loss_sr.item():.4f}")
                 
@@ -926,6 +973,12 @@ def main():
         )
 
         print(f"Checkpoint nach Epoche {epoch} gespeichert.")
+
+        # Gemappte MRT-Dateien zur Speicherfreigabe markieren
+        print(f"\n[RAM] Entlaste Memory-Mappings nach Epoche {epoch}...")
+
+        release_subject_memmap_pages(train_cache)
+        release_subject_memmap_pages(val_cache)
 
         if TEST_RUN and epoch >= TEST_EPOCHS:
             print(f"\nTestlauf nach {TEST_EPOCHS} Epochen beendet.")
