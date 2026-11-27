@@ -35,6 +35,7 @@ from dataset import build_6_zone_sampling_pools
 
 
 n_input_dwi = 30
+suffix = "_new"
 # ===========================================================
 # 1. INFERENCE HILFSFUNKTIONEN (Sliding Window Stitching)
 # ===========================================================
@@ -433,7 +434,7 @@ def main():
         hr_dwi_sh_phys, hr_b0_gt_phys, sample_spec["target_bvals"],
         sample_spec["target_bvecs"], sample_spec["b0_bvals"], hr_mask
     )
-    """
+    
     # =========================================================================
     # fODF Berechnung mittels CSD (Crossing Fibers)
     # =========================================================================
@@ -467,17 +468,17 @@ def main():
     fodf_sh = compute_fodf(vol_sh, gtab, hr_mask, response, sh_order=sh_order)
 
     # 3. Als 4D-NIfTI im Ordner 'Results/' speichern
-    nib.save(nib.Nifti1Image(fodf_gt, affine), "Results/fODF_GT.nii.gz")
-    nib.save(nib.Nifti1Image(fodf_unet, affine), "Results/fODF_UNet.nii.gz")
-    nib.save(nib.Nifti1Image(fodf_sh, affine), "Results/fODF_SH.nii.gz")
+    nib.save(nib.Nifti1Image(fodf_gt, affine), f"Results/fODF_GT{suffix}.nii.gz")
+    nib.save(nib.Nifti1Image(fodf_unet, affine), f"Results/fODF_UNet{suffix}.nii.gz")
+    nib.save(nib.Nifti1Image(fodf_sh, affine), f"Results/fODF_SH{suffix}.nii.gz")
 
     # 8. Quantitative Auswertung & NIfTI Export
     print("\n================ ERGEBNISSE (MAE im Gehirn) ================")
     print(f"Signal MAE (normiert) | U-Net: {compute_masked_mae(hr_dwi_unet, hr_dwi_gt, hr_mask):.5f} "
           f"| SH: {compute_masked_mae(hr_dwi_sh, hr_dwi_gt, hr_mask):.5f}")
-    """
+    
 
-    """
+    
     for m_name in metrics_gt.keys():
         mae_unet = compute_masked_mae(metrics_unet[m_name], metrics_gt[m_name], hr_mask)
         mae_sh = compute_masked_mae(metrics_sh[m_name], metrics_gt[m_name], hr_mask)
@@ -485,9 +486,9 @@ def main():
         print(f"{m_name:6s} MAE            | U-Net: {mae_unet*scale:.5f} | SH: {mae_sh*scale:.5f}")
 
         # Als NIfTI speichern
-        nib.save(nib.Nifti1Image(metrics_gt[m_name].astype(np.float32), affine), f"Results/{m_name}_GT.nii.gz")
-        nib.save(nib.Nifti1Image(metrics_unet[m_name].astype(np.float32), affine), f"Results/{m_name}_UNet.nii.gz")
-        nib.save(nib.Nifti1Image(metrics_sh[m_name].astype(np.float32), affine), f"Results/{m_name}_SH.nii.gz")
+        nib.save(nib.Nifti1Image(metrics_gt[m_name].astype(np.float32), affine), f"Results/{m_name}_GT{suffix}.nii.gz")
+        nib.save(nib.Nifti1Image(metrics_unet[m_name].astype(np.float32), affine), f"Results/{m_name}_UNet{suffix}.nii.gz")
+        nib.save(nib.Nifti1Image(metrics_sh[m_name].astype(np.float32), affine), f"Results/{m_name}_SH{suffix}.nii.gz")
 
     # fODF MAE direkt mit in der Ergebnistabelle ausgeben
     fodf_mae_unet = compute_masked_mae(fodf_unet, fodf_gt, hr_mask)
@@ -502,25 +503,25 @@ def main():
     print(f"  U-Net: {np.std(hr_dwi_unet[hr_mask], axis=-1).mean():.5f}")
     print(f"  SH   : {np.std(hr_dwi_sh[hr_mask], axis=-1).mean():.5f}")
     # 9. Speichern der generierten 4D-DWI-Volumina als NIfTI
-    nib.save(nib.Nifti1Image(hr_dwi_gt_phys.astype(np.float32), affine), "Results/DWI_GT.nii.gz")
-    nib.save(nib.Nifti1Image(hr_dwi_unet_phys.astype(np.float32), affine), "Results/DWI_UNet.nii.gz")
-    nib.save(nib.Nifti1Image(hr_dwi_sh_phys.astype(np.float32), affine), "Results/DWI_SH.nii.gz")
+    nib.save(nib.Nifti1Image(hr_dwi_gt_phys.astype(np.float32), affine), f"Results/DWI_GT{suffix}.nii.gz")
+    nib.save(nib.Nifti1Image(hr_dwi_unet_phys.astype(np.float32), affine), f"Results/DWI_UNet{suffix}.nii.gz")
+    nib.save(nib.Nifti1Image(hr_dwi_sh_phys.astype(np.float32), affine), f"Results/DWI_SH{suffix}.nii.gz")
 
     # 9. Speichern der kompletten 4D-Volumina (b0 + DWI) inkl. bvals/bvecs für DSI Studio
-    nib.save(nib.Nifti1Image(vol_gt.astype(np.float32), affine), "Results/DSI_GT.nii.gz")
-    nib.save(nib.Nifti1Image(vol_unet.astype(np.float32), affine), "Results/DSI_UNet.nii.gz")
-    nib.save(nib.Nifti1Image(vol_sh.astype(np.float32), affine), "Results/DSI_SH.nii.gz")
+    nib.save(nib.Nifti1Image(vol_gt.astype(np.float32), affine), f"Results/DSI_GT{suffix}.nii.gz")
+    nib.save(nib.Nifti1Image(vol_unet.astype(np.float32), affine), f"Results/DSI_UNet{suffix}.nii.gz")
+    nib.save(nib.Nifti1Image(vol_sh.astype(np.float32), affine), f"Results/DSI_SH{suffix}.nii.gz")
     
     # Gehirnmaske für DSI Studio mitexportieren
     nib.save(nib.Nifti1Image(hr_mask.astype(np.uint8), affine), "Results/nodif_brain_mask.nii.gz")
 
     # Zugehörige bval- und bvec-Tabelle speichern (für alle 3 identisch)
-    np.savetxt("Results/DSI_UNet.bval", full_bvals[None, :], fmt="%.1f")
-    np.savetxt("Results/DSI_UNet.bvec", full_bvecs.T, fmt="%.6f")
-    np.savetxt("Results/DSI_GT.bval", full_bvals[None, :], fmt="%.1f")
-    np.savetxt("Results/DSI_GT.bvec", full_bvecs.T, fmt="%.6f")
-    np.savetxt("Results/DSI_SH.bval", full_bvals[None, :], fmt="%.1f")
-    np.savetxt("Results/DSI_SH.bvec", full_bvecs.T, fmt="%.6f")
+    np.savetxt(f"Results/DSI_UNet{suffix}.bval", full_bvals[None, :], fmt="%.1f")
+    np.savetxt(f"Results/DSI_UNet{suffix}.bvec", full_bvecs.T, fmt="%.6f")
+    np.savetxt(f"Results/DSI_GT{suffix}.bval", full_bvals[None, :], fmt="%.1f")
+    np.savetxt(f"Results/DSI_GT{suffix}.bvec", full_bvecs.T, fmt="%.6f")
+    np.savetxt(f"Results/DSI_SH{suffix}.bval", full_bvals[None, :], fmt="%.1f")
+    np.savetxt(f"Results/DSI_SH{suffix}.bvec", full_bvecs.T, fmt="%.6f")
 
     sigma = np.std(hr_b0_in[hr_mask], axis=-1, ddof=1).mean()
     print(f"Rauschboden MAE ≈ {0.8*sigma:.4f}")
@@ -530,7 +531,7 @@ def main():
     print(f"  U-Net: {np.std(hr_dwi_unet[wm], axis=-1).mean():.5f}")
     print(f"  SH   : {np.std(hr_dwi_sh[wm], axis=-1).mean():.5f}")
     print("Alle NIfTI-Karten (inkl. fODF) wurden im Ordner 'Results/' gespeichert.")
-    
+    """
     # --- Regionale Auswertung über die 6 Hirnzonen (Marker) ---
     _, zone_masks = build_6_zone_sampling_pools(hr_b0_in, hr_dwi_gt, hr_mask, patch_size=config.PATCH_SIZE, return_masks=True)
 
@@ -546,7 +547,7 @@ def main():
         print(f"Zone {z_idx} ({z_name:20s}) | fODF MAE -> U-Net: {fodf_u:.5f} vs SH: {fodf_s:.5f} | FA MAE -> U-Net: {fa_u:.5f} vs SH: {fa_s:.5f}")
 
     nib.save(nib.Nifti1Image(zone_label_vol, affine), "Results/Brain_6_Zones_Markers.nii.gz")
-    """
+    
 
     # =========================================================================
     # 10. Kontroll-Vergleich: 30 vs. 60 vs. 90 Richtungen (FA gegen HR-GT 90)
@@ -582,8 +583,8 @@ def main():
     # Metriken gegen HR-GT (90 Richtungen) ausgeben (Ganzhirn & WM)
     wm_90 = hr_mask & (fa_gt90 > 0.2)
     comparisons = [
-        ("HR-GT (30 Input-Dir)", fa_gt30),
-        ("HR-GT (60 Target-Dir)", metrics_gt["FA"]),
+        ("HR-GT (aus 30 Input-Dir)", fa_gt30),
+        ("HR-GT (aus 60 Target-Dir)", metrics_gt["FA"]),
         ("LR-Input (30 Dir, trilinear)", fa_lr30),
         ("U-Net (60 Target-Dir)", metrics_unet["FA"]),
         ("SH-Baseline (60 Target-Dir)", metrics_sh["FA"]),
@@ -604,6 +605,6 @@ def main():
     nib.save(nib.Nifti1Image(fa_gt90.astype(np.float32), affine), "Results/FA_GT_90.nii.gz")
     nib.save(nib.Nifti1Image(fa_gt30.astype(np.float32), affine), "Results/FA_GT_30.nii.gz")
     nib.save(nib.Nifti1Image(fa_lr30.astype(np.float32), affine), "Results/FA_LR_30_trilinear.nii.gz")
-
+    """
 if __name__ == "__main__":
     main()
