@@ -463,19 +463,53 @@ def load_multi_subjects(nifti_paths, bval_paths, bvec_paths, mask_paths, b0_thre
 
 def release_subject_memmap_pages(subjects_cache):
     """
-    Fordert Linux auf, nicht mehr benötigte Speicherseiten
-    der gemappten NPY-Dateien zurückzugewinnen.
-
-    Die Dateien bleiben geöffnet und die Daten unverändert.
-    Bei erneutem Zugriff werden benötigte Seiten wieder geladen.
+    Gibt nicht mehr benötigte Speicherseiten der Read-Only-Memmaps frei.
+    Nutzt MADV_PAGEOUT (falls vom Kernel unterstützt), sonst MADV_DONTNEED,
+    und leert zusätzlich den Linux-Page-Cache via posix_fadvise.
     """
+    released_mmap = 0
+    released_fadvise = 0
 
-    if not hasattr(mmap, "MADV_PAGEOUT"):
-        print(
-            "[RAM] MADV_PAGEOUT wird von Python nicht unterstützt.",
-            flush=True
-        )
-        return
+    madv_pageout = getattr(mmap, "MADV_PAGEOUT", 21)  # Linux-Konstante = 21
+    madv_dontneed = getattr(mmap, "MADV_DONTNEED", None)
+
+    for subj in subjects_cache:
+        for key in ("b0", "dwi"):
+            array = subj.get(key)
+            if array is None:
+                continue
+
+            # 1. Prozess-Mapping entlasten (madvise)
+            mapping = getattr(array, "_mmap", None)
+            if mapping is not None and not mapping.closed:
+                try:
+                    mapping.madvise(madv_pageout)
+                    released_mmap += 1
+                except (OSError, ValueError):
+                    if madv_dontneed is not None:
+                        try:
+                            mapping.madvise(madv_dontneed)
+                            released_mmap += 1
+                        except (OSError, ValueError):
+                            pass
+
+            # 2. Linux Page-Cache für die Datei selbst freigeben (hilft bei cgroup File-RAM)
+            filename = getattr(array, "filename", None)
+            if filename and hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                try:
+                    fd = os.open(filename, os.O_RDONLY)
+                    try:
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                        released_fadvise += 1
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    pass
+
+    print(
+        f"[RAM] Pageout abgeschlossen (madvise: {released_mmap}, posix_fadvise: {released_fadvise}).",
+        flush=True,
+    )
 
     released = 0
 
